@@ -12,6 +12,7 @@
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "BLETask.h"
 
@@ -84,9 +85,13 @@ static esp_ble_mesh_gen_onoff_srv_t onoff_server_2 = {
     .rsp_ctrl.set_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
 };
 
+static esp_ble_mesh_client_t onoff_client;
+ESP_BLE_MESH_MODEL_PUB_DEFINE(onoff_cli_pub, 2 + 1, ROLE_NODE);
+
 static esp_ble_mesh_model_t root_models[] = {
     ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),
     ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&onoff_pub_0, &onoff_server_0),
+    ESP_BLE_MESH_MODEL_GEN_ONOFF_CLI(&onoff_cli_pub, &onoff_client),
 };
 
 static esp_ble_mesh_model_t extend_model_0[] = {
@@ -302,16 +307,14 @@ static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_ev
         case ESP_BLE_MESH_GENERIC_CLIENT_SET_STATE_EVT:
         case ESP_BLE_MESH_GENERIC_CLIENT_PUBLISH_EVT:
             if (opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS) {
-                // Correct access: param->status_cb.onoff_status
                 esp_ble_mesh_gen_onoff_status_cb_t status = param->status_cb.onoff_status;
 
-                ESP_LOGI(TAG, "OnOff Status received:");
-                ESP_LOGI(TAG, "  Present OnOff   : %u", status.present_onoff);
-                ESP_LOGI(TAG, "  Target OnOff    : %u", status.target_onoff);
-                ESP_LOGI(TAG, "  Remaining Time  : 0x%02x", status.remain_time);
-
-                // Example logic:
-                // if (status.present_onoff == 1) { /* device is ON */ }
+                printf("\n========== MESH MSG RECEIVED ==========\n");
+                printf("  From addr     : 0x%04x\n", src_addr);
+                printf("  Present OnOff : %s\n", status.present_onoff ? "ON" : "OFF");
+                printf("  Target OnOff  : %s\n", status.target_onoff  ? "ON" : "OFF");
+                printf("  Remaining Time: 0x%02x\n", status.remain_time);
+                printf("=======================================\n\n");
             } else {
                 ESP_LOGW(TAG, "Unexpected opcode: 0x%06" PRIx32, opcode);
             }
@@ -393,6 +396,42 @@ static esp_err_t ble_mesh_init(void)
     return err;
 }
 
+static esp_timer_handle_t s_rand_timer = NULL;
+
+static void random_delay(esp_timer_cb_t callback, void *arg)
+{
+    uint64_t us = (1000 + (esp_random() % 9001)) * 1000ULL;
+    if (s_rand_timer == NULL) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = callback,
+            .arg      = arg,
+            .name     = "rand_delay",
+        };
+        esp_timer_create(&timer_args, &s_rand_timer);
+    }
+    esp_timer_start_once(s_rand_timer, us);
+}
+
+static void broadcast_group_cb(void *arg)
+{
+    uint8_t status_data[3] = { 0x01, 0x01, 0x00 };
+    esp_ble_mesh_model_t *model = &extend_model_0[0];
+    model->pub->publish_addr = 0xc000;
+    esp_err_t err = esp_ble_mesh_model_publish(
+        model,
+        ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS,
+        sizeof(status_data),
+        status_data,
+        ROLE_NODE
+    );
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "broadcast to 0xc000 failed: %d", err);
+    } else {
+        ESP_LOGI(TAG, "broadcast to 0xc000 sent");
+    }
+    random_delay(broadcast_group_cb, NULL);
+}
+
     /**************************************  BLE MAIN TASK  *****************/
 void BLETask(void)
 {
@@ -423,55 +462,12 @@ void BLETask(void)
     if (err) {
         ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
     }
-    for (;;)
-    {
 
-        ESP_LOGI("BLE", "MESH ON_OFF SERVER inside user code loop");        
+    random_delay(broadcast_group_cb, NULL);
+
+    for (;;) {
         vTaskDelay(10000 / portTICK_PERIOD_MS);
-        {
-            
-            ESP_LOGI("BLE", "MESH ON_OFF SERVER");        
-
-
-            uint8_t status_data[3];
-            // Generic OnOff Status payload: Present OnOff, Target OnOff (optional), Remaining Time (optional)
-            status_data[0] = 0x0; // Present OnOff State
-            status_data[1] = 0x1; // Target OnOff State (No transition in this example)
-            status_data[2] = 0x2;        // Remaining Time (0 indicates immediate change)
-            uint16_t length = 3; 
-
-            esp_ble_mesh_model_t * model = &extend_model_0[0];
-
-            model->pub->publish_addr = 0xc000; 
-
-            // Publish the message
-            esp_err_t err = esp_ble_mesh_model_publish(
-                model, 
-                ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS, 
-                length, 
-                status_data, 
-                ROLE_NODE // Typically ROLE_NODE for a server model
-            );
-
-            model->pub->publish_addr = 0xc001; 
-
-            // Publish the message
-            err = esp_ble_mesh_model_publish(
-                model, 
-                ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS, 
-                length, 
-                status_data, 
-                ROLE_NODE // Typically ROLE_NODE for a server model
-            );
-
-            if (err != ESP_OK) {
-                ESP_LOGE("BLE", "Failed to publish Generic OnOff Status: %d", err);
-            } else {
-                ESP_LOGI("BLE", "Published Generic OnOff Status...");
-            }
-
-        }
-
+        ESP_LOGI(TAG, "BLE Mesh running");
     }
 
 
