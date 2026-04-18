@@ -2,5 +2,6 @@
     "files.associations": {
         "task.h": "c",
         "esp_log.h": "c"
-    }
+    },
+    "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.1/"
 }

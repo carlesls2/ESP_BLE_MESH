@@ -27,6 +27,10 @@
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_generic_model_api.h"
 #include "esp_ble_mesh_local_data_operation_api.h"
+#include <stdio.h>
+#include "esp_log.h"
+#include "esp_ble_mesh_defs.h"
+#include "esp_ble_mesh_generic_model_api.h"
 
 #include "board.h"
 #include "ble_mesh_init.h"
@@ -34,6 +38,10 @@
 #define TAG "EXAMPLE"
 
 #define CID_ESP 0x02E5
+
+
+TickType_t ticks = 0; 
+
 
 extern struct _led_state led_state[3];
 
@@ -223,6 +231,12 @@ static void example_ble_mesh_generic_server_cb(esp_ble_mesh_generic_server_cb_ev
 
     switch (event) {
     case ESP_BLE_MESH_GENERIC_SERVER_STATE_CHANGE_EVT:
+
+        /**
+         * incomming message from mesh node
+         */
+
+
         ESP_LOGI(TAG, "ESP_BLE_MESH_GENERIC_SERVER_STATE_CHANGE_EVT");
         if (param->ctx.recv_op == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET ||
             param->ctx.recv_op == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK) {
@@ -255,6 +269,61 @@ static void example_ble_mesh_generic_server_cb(esp_ble_mesh_generic_server_cb_ev
         break;
     }
 }
+
+
+/**
+ * @brief Example callback function for Generic OnOff Client model
+ *
+ * This function is called when:
+ * - A Generic OnOff Status message is received (from a server)
+ * - A response to a previous Get/Set operation arrives
+ * - An unsolicited publish (status update) from a server arrives
+ *
+ * @param event One of esp_ble_mesh_generic_client_cb_event_t
+ * @param param Pointer to event parameters
+ */
+static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_event_t event,
+                                               esp_ble_mesh_generic_client_cb_param_t *param)
+{
+    ESP_LOGI(TAG, "Generic Client event: 0x%02x, error_code: 0x%02x", event, param->error_code);
+
+    if (param->error_code) {
+        ESP_LOGE(TAG, "Error occurred during processing (0x%02x)", param->error_code);
+        return;
+    }
+
+    uint32_t opcode = param->params->opcode;
+    uint16_t src_addr = param->params->ctx.addr;
+
+    ESP_LOGI(TAG, "Received from src=0x%04x, opcode=0x%06" PRIx32, src_addr, opcode);
+
+    switch (event) {
+        case ESP_BLE_MESH_GENERIC_CLIENT_GET_STATE_EVT:
+        case ESP_BLE_MESH_GENERIC_CLIENT_SET_STATE_EVT:
+        case ESP_BLE_MESH_GENERIC_CLIENT_PUBLISH_EVT:
+            if (opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS) {
+                // Correct access: param->status_cb.onoff_status
+                esp_ble_mesh_gen_onoff_status_cb_t status = param->status_cb.onoff_status;
+
+                ESP_LOGI(TAG, "OnOff Status received:");
+                ESP_LOGI(TAG, "  Present OnOff   : %u", status.present_onoff);
+                ESP_LOGI(TAG, "  Target OnOff    : %u", status.target_onoff);
+                ESP_LOGI(TAG, "  Remaining Time  : 0x%02x", status.remain_time);
+
+                // Example logic:
+                // if (status.present_onoff == 1) { /* device is ON */ }
+            } else {
+                ESP_LOGW(TAG, "Unexpected opcode: 0x%06" PRIx32, opcode);
+            }
+            break;
+
+        default:
+            ESP_LOGW(TAG, "Unhandled event: 0x%02x", event);
+            break;
+    }
+}
+
+
 
 static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t event,
                                               esp_ble_mesh_cfg_server_cb_param_t *param)
@@ -297,6 +366,9 @@ static esp_err_t ble_mesh_init(void)
     esp_ble_mesh_register_prov_callback(example_ble_mesh_provisioning_cb);
     esp_ble_mesh_register_config_server_callback(example_ble_mesh_config_server_cb);
     esp_ble_mesh_register_generic_server_callback(example_ble_mesh_generic_server_cb);
+    esp_ble_mesh_register_generic_client_callback(example_ble_mesh_generic_client_cb); 
+
+
 
     err = esp_ble_mesh_init(&provision, &composition);
     if (err != ESP_OK) {
@@ -309,6 +381,10 @@ static esp_err_t ble_mesh_init(void)
         ESP_LOGE(TAG, "Failed to enable mesh node (err %d)", err);
         return err;
     }
+
+
+ 
+
 
     ESP_LOGI(TAG, "BLE Mesh Node initialized");
 
@@ -349,9 +425,56 @@ void BLETask(void)
     }
     for (;;)
     {
-        ESP_LOGI("BLE", "MESH ON_OFF SERVER");        
+
+        ESP_LOGI("BLE", "MESH ON_OFF SERVER inside user code loop");        
         vTaskDelay(10000 / portTICK_PERIOD_MS);
+        {
+            
+            ESP_LOGI("BLE", "MESH ON_OFF SERVER");        
+
+
+            uint8_t status_data[3];
+            // Generic OnOff Status payload: Present OnOff, Target OnOff (optional), Remaining Time (optional)
+            status_data[0] = 0x0; // Present OnOff State
+            status_data[1] = 0x1; // Target OnOff State (No transition in this example)
+            status_data[2] = 0x2;        // Remaining Time (0 indicates immediate change)
+            uint16_t length = 3; 
+
+            esp_ble_mesh_model_t * model = &extend_model_0[0];
+
+            model->pub->publish_addr = 0xc000; 
+
+            // Publish the message
+            esp_err_t err = esp_ble_mesh_model_publish(
+                model, 
+                ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS, 
+                length, 
+                status_data, 
+                ROLE_NODE // Typically ROLE_NODE for a server model
+            );
+
+            model->pub->publish_addr = 0xc001; 
+
+            // Publish the message
+            err = esp_ble_mesh_model_publish(
+                model, 
+                ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS, 
+                length, 
+                status_data, 
+                ROLE_NODE // Typically ROLE_NODE for a server model
+            );
+
+            if (err != ESP_OK) {
+                ESP_LOGE("BLE", "Failed to publish Generic OnOff Status: %d", err);
+            } else {
+                ESP_LOGI("BLE", "Published Generic OnOff Status...");
+            }
+
+        }
+
     }
+
+
 }
 
 void ble_task_init(void)
