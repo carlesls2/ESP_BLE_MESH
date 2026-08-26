@@ -7,6 +7,8 @@
 #include "BLETask.h"
 #include "blue_led.h"
 #include "device_mode.h"
+#include "spi_cmd.h"
+#include "uart_cmd.h"
 
 #define TAG "MAIN"
 
@@ -25,6 +27,17 @@ void app_main()
 	ESP_ERROR_CHECK(err);
 
 	ESP_ERROR_CHECK(device_mode_init());
+
+	/* Command transports come up before the BLE task so a promotion can be
+	 * accepted as soon as the mesh stack registers its apply callback. A
+	 * transport that fails to start is logged but not fatal -- the other one can
+	 * still drive the switch. */
+	if (uart_cmd_init() != ESP_OK) {
+		ESP_LOGE(TAG, "UART command channel unavailable");
+	}
+	if (spi_cmd_init() != ESP_OK) {
+		ESP_LOGE(TAG, "SPI command channel unavailable");
+	}
 
 	ble_task_init();
 

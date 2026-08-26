@@ -33,9 +33,13 @@
 #include "esp_ble_mesh_defs.h"
 #include "esp_ble_mesh_generic_model_api.h"
 
+#include <stdarg.h>
+
 #include "board.h"
 #include "ble_mesh_init.h"
 #include "device_mode.h"
+#include "spi_cmd.h"
+#include "uart_cmd.h"
 
 #define TAG "EXAMPLE"
 
@@ -227,6 +231,30 @@ static void example_handle_gen_onoff_msg(esp_ble_mesh_model_t *model,
     }
 }
 
+/**
+ * @brief Forward a mesh event to the host over every command transport.
+ *
+ * Gateway role only -- a plain node has no host attached and would just be
+ * talking to itself. Output goes to the same links the mode commands arrive on,
+ * so a host sees traffic in the format it already speaks.
+ */
+static void gateway_bridge_emitf(const char *fmt, ...)
+{
+    if (device_mode_get() != DEVICE_MODE_GATEWAY) {
+        return;
+    }
+
+    char line[96];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    ESP_LOGI(TAG, "bridge -> %s", line);
+    uart_cmd_emit(line);
+    spi_cmd_emit(line);
+}
+
 /* Gateway role: an unprovisioned device matching our UUID filter showed up,
  * queue it for provisioning straight away. */
 static void gateway_recv_unprov_adv_pkt(uint8_t uuid[16], uint8_t addr[BD_ADDR_LEN],
@@ -290,6 +318,10 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
             param->provisioner_prov_complete.element_num,
             param->provisioner_prov_complete.netkey_idx);
         ESP_LOG_BUFFER_HEX("node uuid", param->provisioner_prov_complete.device_uuid, 16);
+        gateway_bridge_emitf("JOINED unicast=0x%04x elems=%d netkey=0x%04x",
+            param->provisioner_prov_complete.unicast_addr,
+            param->provisioner_prov_complete.element_num,
+            param->provisioner_prov_complete.netkey_idx);
         break;
     case ESP_BLE_MESH_PROVISIONER_ADD_UNPROV_DEV_COMP_EVT:
         ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_ADD_UNPROV_DEV_COMP_EVT, err_code %d",
@@ -438,12 +470,11 @@ static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_ev
             if (opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS) {
                 esp_ble_mesh_gen_onoff_status_cb_t status = param->status_cb.onoff_status;
 
-                printf("\n========== MESH MSG RECEIVED ==========\n");
-                printf("  From addr     : 0x%04x\n", src_addr);
-                printf("  Present OnOff : %s\n", status.present_onoff ? "ON" : "OFF");
-                printf("  Target OnOff  : %s\n", status.target_onoff  ? "ON" : "OFF");
-                printf("  Remaining Time: 0x%02x\n", status.remain_time);
-                printf("=======================================\n\n");
+                gateway_bridge_emitf("MSG src=0x%04x onoff=%s target=%s remain=0x%02x",
+                    src_addr,
+                    status.present_onoff ? "ON" : "OFF",
+                    status.target_onoff  ? "ON" : "OFF",
+                    status.remain_time);
             } else {
                 ESP_LOGW(TAG, "Unexpected opcode: 0x%06" PRIx32, opcode);
             }
