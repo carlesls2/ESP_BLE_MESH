@@ -6,6 +6,7 @@
 
 #include "BLETask.h"
 #include "blue_led.h"
+#include "dev_identity.h"
 #include "device_mode.h"
 #include "spi_cmd.h"
 #include "uart_cmd.h"
@@ -27,6 +28,10 @@ void app_main()
 	ESP_ERROR_CHECK(err);
 
 	ESP_ERROR_CHECK(device_mode_init());
+
+	/* Identity is loaded before the mesh starts so a query arriving immediately
+	 * after provisioning already has something to answer with. */
+	ESP_ERROR_CHECK(dev_identity_init());
 
 	/* Command transports come up before the BLE task so a promotion can be
 	 * accepted as soon as the mesh stack registers its apply callback. A
