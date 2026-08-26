@@ -35,9 +35,16 @@ extern "C" {
 #define CMD_PROTO_OP_NODE    0x00
 #define CMD_PROTO_OP_GATEWAY 0x01
 #define CMD_PROTO_OP_QUERY   0x3F
+/* Dumps every local attribute, one reply line each -- the binary counterpart of
+ * "ID?". Reading a single attribute or writing one is line-only: those need an
+ * argument, and widening the fixed 2-byte binary frame to carry a payload is
+ * not worth it for a channel that can fall back to ASCII. */
+#define CMD_PROTO_OP_IDENTITY 0x40
 
-/* Longest line we will buffer before giving up and resyncing. */
-#define CMD_PROTO_MAX_LINE 64
+/* Longest line we will buffer before giving up and resyncing. Sized for the
+ * longest verb plus a maximum-length attribute value, e.g.
+ * "ASK SET 0xC001 NAME <31 chars>". */
+#define CMD_PROTO_MAX_LINE 96
 
 /* How a transport sends a reply back to whoever issued the command. */
 typedef void (*cmd_proto_reply_fn)(const char *text);

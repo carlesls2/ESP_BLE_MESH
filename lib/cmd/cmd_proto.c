@@ -8,6 +8,8 @@
 
 #include "esp_log.h"
 
+#include "dev_attr.h"
+#include "dev_identity.h"
 #include "device_mode.h"
 
 #define TAG "CMD"
@@ -46,6 +48,117 @@ static bool line_is(const char *line, const char *want)
     return strcasecmp(line, want) == 0;
 }
 
+/* Matches a leading verb and hands back whatever follows it, with leading
+ * whitespace trimmed. The prefix must be followed by a space, so "IDLE" does
+ * not match the "ID" verb. */
+static bool line_starts_with(const char *line, const char *prefix, const char **rest)
+{
+    size_t n = strlen(prefix);
+    if (strncasecmp(line, prefix, n) != 0 || line[n] != ' ') {
+        return false;
+    }
+    const char *p = line + n;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == '\0') {
+        return false;
+    }
+    *rest = p;
+    return true;
+}
+
+/* Splits "TOKEN remainder" into an uppercase-insensitive token and the rest.
+ * Returns false if there is no token. `tok` is always terminated. */
+static bool split_token(const char *in, char *tok, size_t tok_size, const char **rest)
+{
+    size_t i = 0;
+    while (in[i] && in[i] != ' ' && in[i] != '\t') {
+        if (i + 1 >= tok_size) {
+            return false;
+        }
+        tok[i] = in[i];
+        i++;
+    }
+    if (i == 0) {
+        return false;
+    }
+    tok[i] = '\0';
+
+    const char *p = in + i;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    *rest = p;
+    return true;
+}
+
+/* Dumps every attribute in the registry, one reply line each. Iterating the
+ * table means a new attribute shows up here with no edit. */
+static void report_identity(cmd_proto_ctx_t *ctx)
+{
+    for (size_t i = 0; i < dev_attr_count(); i++) {
+        const dev_attr_desc_t *desc = dev_attr_at(i);
+        char value[DEV_ATTR_MAX_VALUE_LEN + 1];
+        char msg[DEV_ATTR_MAX_VALUE_LEN + 32];
+
+        if (dev_identity_get_text(desc->id, value, sizeof(value)) == ESP_OK) {
+            snprintf(msg, sizeof(msg), "ID %s %s", desc->name, value);
+        } else {
+            snprintf(msg, sizeof(msg), "ID %s <unreadable>", desc->name);
+        }
+        reply(ctx, msg);
+    }
+}
+
+static void report_one_attr(cmd_proto_ctx_t *ctx, const char *attr_name)
+{
+    const dev_attr_desc_t *desc = dev_attr_find_by_name(attr_name);
+    if (desc == NULL) {
+        reply(ctx, "ERR unknown attribute");
+        return;
+    }
+
+    char value[DEV_ATTR_MAX_VALUE_LEN + 1];
+    char msg[DEV_ATTR_MAX_VALUE_LEN + 32];
+    if (dev_identity_get_text(desc->id, value, sizeof(value)) == ESP_OK) {
+        snprintf(msg, sizeof(msg), "ID %s %s", desc->name, value);
+    } else {
+        snprintf(msg, sizeof(msg), "ID %s <unreadable>", desc->name);
+    }
+    reply(ctx, msg);
+}
+
+static void set_local_attr(cmd_proto_ctx_t *ctx, const char *args)
+{
+    char        attr[24];
+    const char *value = NULL;
+
+    if (!split_token(args, attr, sizeof(attr), &value) || *value == '\0') {
+        reply(ctx, "ERR usage: ID SET <attr> <value>");
+        return;
+    }
+
+    const dev_attr_desc_t *desc = dev_attr_find_by_name(attr);
+    if (desc == NULL) {
+        reply(ctx, "ERR unknown attribute");
+        return;
+    }
+
+    esp_err_t err = dev_identity_set_text(desc->id, value, false);
+    if (err == ESP_OK) {
+        report_one_attr(ctx, desc->name);
+    } else if (err == ESP_ERR_NOT_SUPPORTED) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "ERR %s is read-only", desc->name);
+        reply(ctx, msg);
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "ERR %s", esp_err_to_name(err));
+        reply(ctx, msg);
+    }
+}
+
 static void handle_line(cmd_proto_ctx_t *ctx, char *line)
 {
     /* Trim surrounding whitespace; a monitor may send stray spaces. */
@@ -60,14 +173,22 @@ static void handle_line(cmd_proto_ctx_t *ctx, char *line)
         return;
     }
 
+    const char *rest = NULL;
+
     if (line_is(line, "MODE GATEWAY")) {
         apply_mode(ctx, DEVICE_MODE_GATEWAY);
     } else if (line_is(line, "MODE NODE")) {
         apply_mode(ctx, DEVICE_MODE_NODE);
     } else if (line_is(line, "MODE?") || line_is(line, "MODE")) {
         report_mode(ctx);
+    } else if (line_is(line, "ID?") || line_is(line, "ID")) {
+        report_identity(ctx);
+    } else if (line_starts_with(line, "ID SET", &rest)) {
+        set_local_attr(ctx, rest);
+    } else if (line_starts_with(line, "ID GET", &rest)) {
+        report_one_attr(ctx, rest);
     } else {
-        reply(ctx, "ERR unknown command (try MODE GATEWAY | MODE NODE | MODE?)");
+        reply(ctx, "ERR unknown command (MODE GATEWAY|NODE|? / ID? / ID GET <attr> / ID SET <attr> <val>)");
     }
 }
 
@@ -82,6 +203,9 @@ static void handle_binary(cmd_proto_ctx_t *ctx, uint8_t op)
         break;
     case CMD_PROTO_OP_QUERY:
         report_mode(ctx);
+        break;
+    case CMD_PROTO_OP_IDENTITY:
+        report_identity(ctx);
         break;
     default:
         ESP_LOGW(TAG, "[%s] unknown binary opcode 0x%02x", ctx->tag, op);
