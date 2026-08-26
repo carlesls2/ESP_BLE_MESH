@@ -33,20 +33,41 @@
 #include "esp_ble_mesh_defs.h"
 #include "esp_ble_mesh_generic_model_api.h"
 
+#include <stdarg.h>
+
 #include "board.h"
 #include "ble_mesh_init.h"
+#include "device_mode.h"
+#include "spi_cmd.h"
+#include "uart_cmd.h"
 
 #define TAG "EXAMPLE"
 
 #define CID_ESP 0x02E5
 
+/* Provisioner (gateway) parameters. PROV_OWN_ADDR is the address this device
+ * uses when acting as Provisioner; provisioned nodes are handed addresses from
+ * PROV_START_ADDR upwards. A gateway should be the provisioner of its own
+ * network -- if it is also provisioned by an external app it will end up with
+ * two conflicting unicast addresses. */
+#define PROV_OWN_ADDR   0x0001
+#define PROV_START_ADDR 0x0005
+#define APP_KEY_IDX     0x0000
+#define APP_KEY_OCTET   0x12
 
-TickType_t ticks = 0; 
+
+TickType_t ticks = 0;
 
 
 extern struct _led_state led_state[3];
 
 static uint8_t dev_uuid[16] = { 0xdd, 0xdd };
+
+static struct esp_ble_mesh_key {
+    uint16_t net_idx;
+    uint16_t app_idx;
+    uint8_t  app_key[16];
+} prov_key;
 
 static esp_ble_mesh_cfg_srv_t config_server = {
     .relay = ESP_BLE_MESH_RELAY_DISABLED,
@@ -88,8 +109,13 @@ static esp_ble_mesh_gen_onoff_srv_t onoff_server_2 = {
 static esp_ble_mesh_client_t onoff_client;
 ESP_BLE_MESH_MODEL_PUB_DEFINE(onoff_cli_pub, 2 + 1, ROLE_NODE);
 
+/* Only exercised in gateway mode, but the composition is fixed at
+ * esp_ble_mesh_init() time so the model is always present. */
+static esp_ble_mesh_client_t config_client;
+
 static esp_ble_mesh_model_t root_models[] = {
     ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),
+    ESP_BLE_MESH_MODEL_CFG_CLI(&config_client),
     ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&onoff_pub_0, &onoff_server_0),
     ESP_BLE_MESH_MODEL_GEN_ONOFF_CLI(&onoff_cli_pub, &onoff_client),
 };
@@ -114,7 +140,9 @@ static esp_ble_mesh_comp_t composition = {
     .element_count = ARRAY_SIZE(elements),
 };
 
-/* Disable OOB security for SILabs Android app */
+/* Disable OOB security for SILabs Android app.
+ * Carries both role's parameters: the node fields are used when this device is
+ * provisioned by someone else, the prov_* fields when it acts as gateway. */
 static esp_ble_mesh_prov_t provision = {
     .uuid = dev_uuid,
 #if 0
@@ -126,6 +154,16 @@ static esp_ble_mesh_prov_t provision = {
     .output_size = 0,
     .output_actions = 0,
 #endif
+    .prov_uuid           = dev_uuid,
+    .prov_unicast_addr   = PROV_OWN_ADDR,
+    .prov_start_address  = PROV_START_ADDR,
+    .prov_attention      = 0x00,
+    .prov_algorithm      = 0x00,
+    .prov_pub_key_oob    = 0x00,
+    .prov_static_oob_val = NULL,
+    .prov_static_oob_len = 0x00,
+    .flags               = 0x00,
+    .iv_index            = 0x00,
 };
 
 static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32_t iv_index)
@@ -193,10 +231,133 @@ static void example_handle_gen_onoff_msg(esp_ble_mesh_model_t *model,
     }
 }
 
+/**
+ * @brief Forward a mesh event to the host over every command transport.
+ *
+ * Gateway role only -- a plain node has no host attached and would just be
+ * talking to itself. Output goes to the same links the mode commands arrive on,
+ * so a host sees traffic in the format it already speaks.
+ */
+static void gateway_bridge_emitf(const char *fmt, ...)
+{
+    if (device_mode_get() != DEVICE_MODE_GATEWAY) {
+        return;
+    }
+
+    char line[96];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    ESP_LOGI(TAG, "bridge -> %s", line);
+    uart_cmd_emit(line);
+    spi_cmd_emit(line);
+}
+
+/* Gateway role: an unprovisioned device matching our UUID filter showed up,
+ * queue it for provisioning straight away. */
+static void gateway_recv_unprov_adv_pkt(uint8_t uuid[16], uint8_t addr[BD_ADDR_LEN],
+                                        esp_ble_mesh_addr_type_t addr_type, uint16_t oob_info,
+                                        uint8_t adv_type, esp_ble_mesh_prov_bearer_t bearer)
+{
+    esp_ble_mesh_unprov_dev_add_t add_dev = {0};
+    esp_err_t err;
+
+    ESP_LOGI(TAG, "unprovisioned device found, addr type %d, adv type %d, oob 0x%04x, bearer %s",
+        addr_type, adv_type, oob_info, (bearer & ESP_BLE_MESH_PROV_ADV) ? "PB-ADV" : "PB-GATT");
+    ESP_LOG_BUFFER_HEX("dev addr", addr, BD_ADDR_LEN);
+    ESP_LOG_BUFFER_HEX("dev uuid", uuid, 16);
+
+    memcpy(add_dev.addr, addr, BD_ADDR_LEN);
+    add_dev.addr_type = (uint8_t)addr_type;
+    memcpy(add_dev.uuid, uuid, 16);
+    add_dev.oob_info = oob_info;
+    add_dev.bearer = (uint8_t)bearer;
+
+    err = esp_ble_mesh_provisioner_add_unprov_dev(&add_dev,
+            ADD_DEV_RM_AFTER_PROV_FLAG | ADD_DEV_START_PROV_NOW_FLAG | ADD_DEV_FLUSHABLE_DEV_FLAG);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to queue unprovisioned device (err %d)", err);
+    }
+}
+
 static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
                                              esp_ble_mesh_prov_cb_param_t *param)
 {
     switch (event) {
+    /* ---- Provisioner (gateway) events ---- */
+    case ESP_BLE_MESH_PROVISIONER_PROV_ENABLE_COMP_EVT:
+        ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_PROV_ENABLE_COMP_EVT, err_code %d",
+            param->provisioner_prov_enable_comp.err_code);
+        break;
+    case ESP_BLE_MESH_PROVISIONER_PROV_DISABLE_COMP_EVT:
+        ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_PROV_DISABLE_COMP_EVT, err_code %d",
+            param->provisioner_prov_disable_comp.err_code);
+        break;
+    case ESP_BLE_MESH_PROVISIONER_RECV_UNPROV_ADV_PKT_EVT:
+        gateway_recv_unprov_adv_pkt(param->provisioner_recv_unprov_adv_pkt.dev_uuid,
+                                    param->provisioner_recv_unprov_adv_pkt.addr,
+                                    param->provisioner_recv_unprov_adv_pkt.addr_type,
+                                    param->provisioner_recv_unprov_adv_pkt.oob_info,
+                                    param->provisioner_recv_unprov_adv_pkt.adv_type,
+                                    param->provisioner_recv_unprov_adv_pkt.bearer);
+        break;
+    case ESP_BLE_MESH_PROVISIONER_PROV_LINK_OPEN_EVT:
+        ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_PROV_LINK_OPEN_EVT, bearer %s",
+            param->provisioner_prov_link_open.bearer == ESP_BLE_MESH_PROV_ADV ? "PB-ADV" : "PB-GATT");
+        break;
+    case ESP_BLE_MESH_PROVISIONER_PROV_LINK_CLOSE_EVT:
+        ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_PROV_LINK_CLOSE_EVT, bearer %s, reason 0x%02x",
+            param->provisioner_prov_link_close.bearer == ESP_BLE_MESH_PROV_ADV ? "PB-ADV" : "PB-GATT",
+            param->provisioner_prov_link_close.reason);
+        break;
+    case ESP_BLE_MESH_PROVISIONER_PROV_COMPLETE_EVT:
+        ESP_LOGI(TAG, "node provisioned: unicast 0x%04x, elem_num %d, netkey_idx 0x%04x",
+            param->provisioner_prov_complete.unicast_addr,
+            param->provisioner_prov_complete.element_num,
+            param->provisioner_prov_complete.netkey_idx);
+        ESP_LOG_BUFFER_HEX("node uuid", param->provisioner_prov_complete.device_uuid, 16);
+        gateway_bridge_emitf("JOINED unicast=0x%04x elems=%d netkey=0x%04x",
+            param->provisioner_prov_complete.unicast_addr,
+            param->provisioner_prov_complete.element_num,
+            param->provisioner_prov_complete.netkey_idx);
+        break;
+    case ESP_BLE_MESH_PROVISIONER_ADD_UNPROV_DEV_COMP_EVT:
+        ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_ADD_UNPROV_DEV_COMP_EVT, err_code %d",
+            param->provisioner_add_unprov_dev_comp.err_code);
+        break;
+    case ESP_BLE_MESH_PROVISIONER_SET_DEV_UUID_MATCH_COMP_EVT:
+        ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_SET_DEV_UUID_MATCH_COMP_EVT, err_code %d",
+            param->provisioner_set_dev_uuid_match_comp.err_code);
+        break;
+    case ESP_BLE_MESH_PROVISIONER_ADD_LOCAL_APP_KEY_COMP_EVT:
+        ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_ADD_LOCAL_APP_KEY_COMP_EVT, err_code %d",
+            param->provisioner_add_app_key_comp.err_code);
+        if (param->provisioner_add_app_key_comp.err_code == ESP_OK) {
+            prov_key.app_idx = param->provisioner_add_app_key_comp.app_idx;
+            /* Bind to both local clients so the gateway can configure nodes and
+             * drive their OnOff state. */
+            esp_err_t err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
+                PROV_OWN_ADDR, prov_key.app_idx,
+                ESP_BLE_MESH_MODEL_ID_CONFIG_CLI, ESP_BLE_MESH_CID_NVAL);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "failed to bind appkey to Config Client (err %d)", err);
+            }
+            err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
+                PROV_OWN_ADDR, prov_key.app_idx,
+                ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_CLI, ESP_BLE_MESH_CID_NVAL);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "failed to bind appkey to OnOff Client (err %d)", err);
+            }
+        }
+        break;
+    case ESP_BLE_MESH_PROVISIONER_BIND_APP_KEY_TO_MODEL_COMP_EVT:
+        ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_BIND_APP_KEY_TO_MODEL_COMP_EVT, err_code %d",
+            param->provisioner_bind_app_key_to_model_comp.err_code);
+        break;
+
+    /* ---- Node events ---- */
     case ESP_BLE_MESH_PROV_REGISTER_COMP_EVT:
         ESP_LOGI(TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
         break;
@@ -309,12 +470,11 @@ static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_ev
             if (opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS) {
                 esp_ble_mesh_gen_onoff_status_cb_t status = param->status_cb.onoff_status;
 
-                printf("\n========== MESH MSG RECEIVED ==========\n");
-                printf("  From addr     : 0x%04x\n", src_addr);
-                printf("  Present OnOff : %s\n", status.present_onoff ? "ON" : "OFF");
-                printf("  Target OnOff  : %s\n", status.target_onoff  ? "ON" : "OFF");
-                printf("  Remaining Time: 0x%02x\n", status.remain_time);
-                printf("=======================================\n\n");
+                gateway_bridge_emitf("MSG src=0x%04x onoff=%s target=%s remain=0x%02x",
+                    src_addr,
+                    status.present_onoff ? "ON" : "OFF",
+                    status.target_onoff  ? "ON" : "OFF",
+                    status.remain_time);
             } else {
                 ESP_LOGW(TAG, "Unexpected opcode: 0x%06" PRIx32, opcode);
             }
@@ -362,14 +522,34 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
     }
 }
 
+/**
+ * @brief Config Client callback -- gateway role only.
+ *
+ * Fires when a node answers a configuration request the gateway sent while
+ * bringing it into the network.
+ */
+static void example_ble_mesh_config_client_cb(esp_ble_mesh_cfg_client_cb_event_t event,
+                                              esp_ble_mesh_cfg_client_cb_param_t *param)
+{
+    if (param->error_code != ESP_OK) {
+        ESP_LOGE(TAG, "Config Client error 0x%02x (opcode 0x%04" PRIx32 ")",
+            param->error_code, param->params ? param->params->opcode : 0);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Config Client event 0x%02x, src 0x%04x, opcode 0x%04" PRIx32,
+        event, param->params->ctx.addr, param->params->opcode);
+}
+
 static esp_err_t ble_mesh_init(void)
 {
     esp_err_t err = ESP_OK;
 
     esp_ble_mesh_register_prov_callback(example_ble_mesh_provisioning_cb);
     esp_ble_mesh_register_config_server_callback(example_ble_mesh_config_server_cb);
+    esp_ble_mesh_register_config_client_callback(example_ble_mesh_config_client_cb);
     esp_ble_mesh_register_generic_server_callback(example_ble_mesh_generic_server_cb);
-    esp_ble_mesh_register_generic_client_callback(example_ble_mesh_generic_client_cb); 
+    esp_ble_mesh_register_generic_client_callback(example_ble_mesh_generic_client_cb);
 
 
 
@@ -379,6 +559,9 @@ static esp_err_t ble_mesh_init(void)
         return err;
     }
 
+    /* The node role is always available so the device can still be provisioned
+     * by someone else; the provisioner role is enabled on demand in
+     * ble_mesh_apply_mode(). */
     err = esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable mesh node (err %d)", err);
@@ -386,10 +569,10 @@ static esp_err_t ble_mesh_init(void)
     }
 
 
- 
 
 
-    ESP_LOGI(TAG, "BLE Mesh Node initialized");
+
+    ESP_LOGI(TAG, "BLE Mesh stack initialized");
 
     board_led_operation(LED_G, LED_ON);
 
@@ -412,8 +595,22 @@ static void random_delay(esp_timer_cb_t callback, void *arg)
     esp_timer_start_once(s_rand_timer, us);
 }
 
+static void broadcast_stop(void)
+{
+    if (s_rand_timer) {
+        esp_timer_stop(s_rand_timer);
+    }
+}
+
 static void broadcast_group_cb(void *arg)
 {
+    /* A gateway does not spam the group address -- it listens and bridges.
+     * Checked here as well as at stop time so a switch that races the timer
+     * cannot re-arm it. */
+    if (device_mode_get() != DEVICE_MODE_NODE) {
+        return;
+    }
+
     uint8_t status_data[3] = { 0x01, 0x01, 0x00 };
     esp_ble_mesh_model_t *model = &extend_model_0[0];
     model->pub->publish_addr = 0xc000;
@@ -432,6 +629,66 @@ static void broadcast_group_cb(void *arg)
     random_delay(broadcast_group_cb, NULL);
 }
 
+/**
+ * @brief Enter NODE or GATEWAY behaviour on the live mesh stack.
+ *
+ * Registered with lib/mode via device_mode_register_apply_cb(), so it runs both
+ * at boot (for the mode restored from NVS) and on every runtime switch.
+ * Returning an error aborts the switch and leaves the previous mode in place.
+ */
+static esp_err_t ble_mesh_apply_mode(device_mode_t mode)
+{
+    esp_err_t err;
+
+    if (mode == DEVICE_MODE_GATEWAY) {
+        /* Only report unprovisioned devices whose UUID starts 0xdd 0xdd, which
+         * is what this firmware advertises as a node (see dev_uuid). */
+        static const uint8_t match[2] = { 0xdd, 0xdd };
+        err = esp_ble_mesh_provisioner_set_dev_uuid_match(match, sizeof(match), 0x0, false);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to set UUID match (err %d)", err);
+            return err;
+        }
+
+        err = esp_ble_mesh_provisioner_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to enable provisioner (err %d)", err);
+            return err;
+        }
+
+        /* Generate the app key once; re-enabling the gateway later reuses it.
+         * The bind to the local clients happens on ADD_LOCAL_APP_KEY_COMP_EVT. */
+        if (prov_key.app_idx != APP_KEY_IDX || prov_key.app_key[0] == 0) {
+            prov_key.net_idx = ESP_BLE_MESH_NET_PRIMARY;
+            prov_key.app_idx = APP_KEY_IDX;
+            memset(prov_key.app_key, APP_KEY_OCTET, sizeof(prov_key.app_key));
+
+            err = esp_ble_mesh_provisioner_add_local_app_key(prov_key.app_key,
+                                                             prov_key.net_idx,
+                                                             prov_key.app_idx);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "failed to add local app key (err %d)", err);
+                return err;
+            }
+        }
+
+        broadcast_stop();
+        ESP_LOGI(TAG, "gateway active: provisioner enabled, broadcast stopped");
+    } else {
+        err = esp_ble_mesh_provisioner_prov_disable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            /* INVALID_STATE just means it was never enabled -- fine at boot. */
+            ESP_LOGE(TAG, "failed to disable provisioner (err %d)", err);
+            return err;
+        }
+
+        random_delay(broadcast_group_cb, NULL);
+        ESP_LOGI(TAG, "node active: provisioner disabled, broadcast running");
+    }
+
+    return ESP_OK;
+}
+
     /**************************************  BLE MAIN TASK  *****************/
 void BLETask(void)
 {
@@ -442,12 +699,8 @@ void BLETask(void)
 
     board_init();
 
-    err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
+    /* NVS is brought up in app_main(), before device_mode_init() reads the
+     * stored role. */
 
     err = bluetooth_init();
     if (err) {
@@ -461,13 +714,17 @@ void BLETask(void)
     err = ble_mesh_init();
     if (err) {
         ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
+        return;
     }
 
-    random_delay(broadcast_group_cb, NULL);
+    /* Now that the stack is up, hand it to lib/mode and enter the role that was
+     * restored from NVS. Every later switch comes back through the same path. */
+    device_mode_register_apply_cb(ble_mesh_apply_mode);
+    device_mode_apply_stored();
 
     for (;;) {
         vTaskDelay(10000 / portTICK_PERIOD_MS);
-        ESP_LOGI(TAG, "BLE Mesh running");
+        ESP_LOGI(TAG, "BLE Mesh running as %s", device_mode_name(device_mode_get()));
     }
 
 
