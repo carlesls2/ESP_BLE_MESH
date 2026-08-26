@@ -82,6 +82,16 @@ esp_err_t mesh_attr_get(uint16_t dst, const dev_attr_id_t *ids, size_t id_count)
  * carries DEV_ATTR_FLAG_REMOTE. */
 esp_err_t mesh_attr_set(uint16_t dst, dev_attr_id_t id, const char *text);
 
+/* --- Group membership ---------------------------------------------------- */
+
+/* Subscribes the attribute server model to whatever GROUP_ADDR currently holds,
+ * dropping the previous subscription first. Call once the node is provisioned
+ * (a subscription needs an element address), and again whenever GROUP_ADDR
+ * changes -- wiring it to dev_identity_register_change_cb() does both.
+ *
+ * A GROUP_ADDR of 0x0000 means unassigned and only unsubscribes. */
+esp_err_t mesh_attr_apply_group(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -177,6 +177,10 @@ static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32
     ESP_LOGI(TAG, "net_idx: 0x%04x, addr: 0x%04x", net_idx, addr);
     ESP_LOGI(TAG, "flags: 0x%02x, iv_index: 0x%08"PRIx32, flags, iv_index);
     board_led_operation(LED_G, LED_OFF);
+
+    /* Now that an element address exists, the stored group can finally be
+     * subscribed. This is what restores group membership across a reboot. */
+    mesh_attr_apply_group();
 }
 
 static void example_change_led_state(esp_ble_mesh_model_t *model,
@@ -556,6 +560,15 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
  * Fires when a node answers a configuration request the gateway sent while
  * bringing it into the network.
  */
+/* GROUP_ADDR is the one attribute with a side effect beyond being reported:
+ * changing it moves which multicast traffic this node actually receives. */
+static void identity_changed(dev_attr_id_t id)
+{
+    if (id == DEV_ATTR_GROUP_ADDR) {
+        mesh_attr_apply_group();
+    }
+}
+
 /* Query results reach the host on the same links commands arrive on. */
 static void attr_status_to_host(uint16_t src_addr, const char *text)
 {
@@ -705,6 +718,7 @@ static esp_err_t ble_mesh_init(void)
     /* Lets the ASK verbs on the host channel reach the mesh without lib/cmd
      * having to depend on lib/BLE. */
     cmd_proto_register_mesh(mesh_attr_get, mesh_attr_set);
+    dev_identity_register_change_cb(identity_changed);
 
     ESP_LOGI(TAG, "BLE Mesh stack initialized");
 
@@ -807,6 +821,9 @@ static esp_err_t ble_mesh_apply_mode(device_mode_t mode)
         }
 
         broadcast_stop();
+        /* A provisioner owns PROV_OWN_ADDR from init, so unlike a node it can
+         * join its group without waiting to be provisioned. */
+        mesh_attr_apply_group();
         ESP_LOGI(TAG, "gateway active: provisioner enabled, broadcast stopped");
     } else {
         err = esp_ble_mesh_provisioner_prov_disable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);

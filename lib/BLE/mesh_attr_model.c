@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "esp_ble_mesh_common_api.h"
+#include "esp_ble_mesh_local_data_operation_api.h"
 #include "esp_ble_mesh_networking_api.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -319,6 +320,64 @@ esp_err_t mesh_attr_model_init(void)
     }
 
     ESP_LOGI(TAG, "attribute model ready (%u attributes)", (unsigned)dev_attr_count());
+    return ESP_OK;
+}
+
+/* --- Group membership ---------------------------------------------------- */
+
+/* Tracked so a change can drop the old subscription; the stack has no "replace"
+ * operation and leaving the previous one in place would silently widen what the
+ * node listens to. */
+static uint16_t s_current_group = 0x0000;
+
+esp_err_t mesh_attr_apply_group(void)
+{
+    if (MODEL_SERVER->element == NULL) {
+        /* Not provisioned yet: no element address to subscribe with. The retry
+         * comes from prov-complete calling this again. */
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint16_t element_addr = MODEL_SERVER->element->element_addr;
+    uint16_t want = dev_identity_group_addr();
+
+    if (want == s_current_group) {
+        return ESP_OK;
+    }
+
+    if (s_current_group != 0x0000) {
+        esp_err_t err = esp_ble_mesh_model_unsubscribe_group_addr(
+            element_addr, CID_ESP, MESH_ATTR_MODEL_ID_SERVER, s_current_group);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "failed to leave group 0x%04x: %d", s_current_group, err);
+        } else {
+            ESP_LOGI(TAG, "left group 0x%04x", s_current_group);
+        }
+    }
+
+    s_current_group = 0x0000;
+
+    if (want == 0x0000) {
+        ESP_LOGI(TAG, "group unassigned");
+        return ESP_OK;
+    }
+
+    /* Only 0xC000-0xFEFF are valid group addresses; anything else would be
+     * rejected by the stack with a less obvious error. */
+    if (!ESP_BLE_MESH_ADDR_IS_GROUP(want)) {
+        ESP_LOGE(TAG, "0x%04x is not a group address (expected 0xC000-0xFEFF)", want);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = esp_ble_mesh_model_subscribe_group_addr(
+        element_addr, CID_ESP, MESH_ATTR_MODEL_ID_SERVER, want);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to join group 0x%04x: %d", want, err);
+        return err;
+    }
+
+    s_current_group = want;
+    ESP_LOGI(TAG, "joined group 0x%04x", want);
     return ESP_OK;
 }
 
