@@ -37,7 +37,9 @@
 
 #include "board.h"
 #include "ble_mesh_init.h"
+#include "dev_identity.h"
 #include "device_mode.h"
+#include "mesh_attr_model.h"
 #include "spi_cmd.h"
 #include "uart_cmd.h"
 
@@ -129,7 +131,10 @@ static esp_ble_mesh_model_t extend_model_1[] = {
 };
 
 static esp_ble_mesh_elem_t elements[] = {
-    ESP_BLE_MESH_ELEMENT(0, root_models, ESP_BLE_MESH_MODEL_NONE),
+    /* The attribute vendor models ride in element 0's vendor slot, which was
+     * previously unused. Present in both personalities: a gateway asks with the
+     * client half, a node answers with the server half. */
+    ESP_BLE_MESH_ELEMENT(0, root_models, mesh_attr_vnd_models),
     ESP_BLE_MESH_ELEMENT(0, extend_model_0, ESP_BLE_MESH_MODEL_NONE),
     ESP_BLE_MESH_ELEMENT(0, extend_model_1, ESP_BLE_MESH_MODEL_NONE),
 };
@@ -571,6 +576,14 @@ static esp_err_t ble_mesh_init(void)
 
 
 
+
+    /* Registers the custom-model callback, so it has to follow
+     * esp_ble_mesh_init(). A node needs this to answer queries at all. */
+    err = mesh_attr_model_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start attribute model (err %d)", err);
+        return err;
+    }
 
     ESP_LOGI(TAG, "BLE Mesh stack initialized");
 
