@@ -27,6 +27,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "esp_err.h"
+
+#include "dev_attr.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -60,6 +64,16 @@ typedef struct {
 } cmd_proto_ctx_t;
 
 void cmd_proto_ctx_init(cmd_proto_ctx_t *ctx, const char *tag, cmd_proto_reply_fn reply);
+
+/* The ASK verbs reach the mesh through these, registered by the BLE layer.
+ * Inverting the dependency this way keeps lib/cmd free of lib/BLE, which
+ * already includes uart_cmd.h and spi_cmd.h -- a direct call the other way
+ * would make the two libraries mutually dependent. Same shape as the apply
+ * callback in device_mode.h. */
+typedef esp_err_t (*cmd_mesh_get_fn)(uint16_t dst, const dev_attr_id_t *ids, size_t id_count);
+typedef esp_err_t (*cmd_mesh_set_fn)(uint16_t dst, dev_attr_id_t id, const char *text);
+
+void cmd_proto_register_mesh(cmd_mesh_get_fn get_fn, cmd_mesh_set_fn set_fn);
 
 /* Feed received bytes. Complete commands are executed as they are recognised;
  * partial input is retained until the rest arrives. */

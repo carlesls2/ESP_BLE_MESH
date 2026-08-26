@@ -159,6 +159,136 @@ static void set_local_attr(cmd_proto_ctx_t *ctx, const char *args)
     }
 }
 
+static cmd_mesh_get_fn s_mesh_get = NULL;
+static cmd_mesh_set_fn s_mesh_set = NULL;
+
+void cmd_proto_register_mesh(cmd_mesh_get_fn get_fn, cmd_mesh_set_fn set_fn)
+{
+    s_mesh_get = get_fn;
+    s_mesh_set = set_fn;
+}
+
+/* "ALL" targets the all-nodes broadcast address; anything else is parsed as an
+ * address, so a group address like 0xC001 reaches just that group. */
+static bool parse_target(const char *tok, uint16_t *addr)
+{
+    if (strcasecmp(tok, "ALL") == 0) {
+        *addr = 0xFFFF;
+        return true;
+    }
+    char *end = NULL;
+    unsigned long v = strtoul(tok, &end, 0);
+    if (end == tok || *end != '\0' || v == 0 || v > 0xFFFF) {
+        return false;
+    }
+    *addr = (uint16_t)v;
+    return true;
+}
+
+static void mesh_err_reply(cmd_proto_ctx_t *ctx, esp_err_t err)
+{
+    char msg[80];
+    if (err == ESP_ERR_INVALID_STATE) {
+        snprintf(msg, sizeof(msg), "ERR mesh not ready (promote to gateway first)");
+    } else if (err == ESP_ERR_NOT_SUPPORTED) {
+        snprintf(msg, sizeof(msg), "ERR attribute is not remotely writable");
+    } else {
+        snprintf(msg, sizeof(msg), "ERR %s", esp_err_to_name(err));
+    }
+    reply(ctx, msg);
+}
+
+/* ASK SET <target> <attr> <value> */
+static void ask_remote_set(cmd_proto_ctx_t *ctx, const char *args)
+{
+    char        target[16];
+    char        attr[24];
+    const char *rest = NULL;
+    const char *value = NULL;
+
+    if (s_mesh_set == NULL) {
+        reply(ctx, "ERR mesh not available");
+        return;
+    }
+    if (!split_token(args, target, sizeof(target), &rest) ||
+        !split_token(rest, attr, sizeof(attr), &value) || *value == '\0') {
+        reply(ctx, "ERR usage: ASK SET <addr> <attr> <value>");
+        return;
+    }
+
+    uint16_t dst;
+    if (!parse_target(target, &dst)) {
+        reply(ctx, "ERR bad address");
+        return;
+    }
+
+    const dev_attr_desc_t *desc = dev_attr_find_by_name(attr);
+    if (desc == NULL) {
+        reply(ctx, "ERR unknown attribute");
+        return;
+    }
+
+    esp_err_t err = s_mesh_set(dst, desc->id, value);
+    if (err == ESP_OK) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "ASK SET 0x%04x %s sent", dst, desc->name);
+        reply(ctx, msg);
+    } else {
+        mesh_err_reply(ctx, err);
+    }
+}
+
+/* ASK <target> [attr ...] -- results arrive asynchronously on the bridge. */
+static void ask_query(cmd_proto_ctx_t *ctx, const char *args)
+{
+    char        target[16];
+    const char *rest = NULL;
+
+    if (s_mesh_get == NULL) {
+        reply(ctx, "ERR mesh not available");
+        return;
+    }
+    if (!split_token(args, target, sizeof(target), &rest)) {
+        reply(ctx, "ERR usage: ASK <addr|ALL> [attr ...]");
+        return;
+    }
+
+    uint16_t dst;
+    if (!parse_target(target, &dst)) {
+        reply(ctx, "ERR bad address");
+        return;
+    }
+
+    /* No attribute names means everything; naming a few keeps the reply small
+     * enough to travel in a single unsegmented message. */
+    dev_attr_id_t ids[8];
+    size_t        count = 0;
+    char          attr[24];
+
+    while (*rest != '\0' && count < sizeof(ids) / sizeof(ids[0])) {
+        const char *next = NULL;
+        if (!split_token(rest, attr, sizeof(attr), &next)) {
+            break;
+        }
+        const dev_attr_desc_t *desc = dev_attr_find_by_name(attr);
+        if (desc == NULL) {
+            reply(ctx, "ERR unknown attribute");
+            return;
+        }
+        ids[count++] = desc->id;
+        rest = next;
+    }
+
+    esp_err_t err = s_mesh_get(dst, count ? ids : NULL, count);
+    if (err == ESP_OK) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "ASK 0x%04x sent (%u attrs)", dst, (unsigned)count);
+        reply(ctx, msg);
+    } else {
+        mesh_err_reply(ctx, err);
+    }
+}
+
 static void handle_line(cmd_proto_ctx_t *ctx, char *line)
 {
     /* Trim surrounding whitespace; a monitor may send stray spaces. */
@@ -187,8 +317,12 @@ static void handle_line(cmd_proto_ctx_t *ctx, char *line)
         set_local_attr(ctx, rest);
     } else if (line_starts_with(line, "ID GET", &rest)) {
         report_one_attr(ctx, rest);
+    } else if (line_starts_with(line, "ASK SET", &rest)) {
+        ask_remote_set(ctx, rest);
+    } else if (line_starts_with(line, "ASK", &rest)) {
+        ask_query(ctx, rest);
     } else {
-        reply(ctx, "ERR unknown command (MODE GATEWAY|NODE|? / ID? / ID GET <attr> / ID SET <attr> <val>)");
+        reply(ctx, "ERR unknown command (MODE / ID? / ID GET|SET / ASK <addr|ALL> [attr] / ASK SET <addr> <attr> <val>)");
     }
 }
 
