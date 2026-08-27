@@ -37,7 +37,10 @@
 
 #include "board.h"
 #include "ble_mesh_init.h"
+#include "dev_identity.h"
 #include "device_mode.h"
+#include "cmd_proto.h"
+#include "mesh_attr_model.h"
 #include "spi_cmd.h"
 #include "uart_cmd.h"
 
@@ -129,7 +132,10 @@ static esp_ble_mesh_model_t extend_model_1[] = {
 };
 
 static esp_ble_mesh_elem_t elements[] = {
-    ESP_BLE_MESH_ELEMENT(0, root_models, ESP_BLE_MESH_MODEL_NONE),
+    /* The attribute vendor models ride in element 0's vendor slot, which was
+     * previously unused. Present in both personalities: a gateway asks with the
+     * client half, a node answers with the server half. */
+    ESP_BLE_MESH_ELEMENT(0, root_models, mesh_attr_vnd_models),
     ESP_BLE_MESH_ELEMENT(0, extend_model_0, ESP_BLE_MESH_MODEL_NONE),
     ESP_BLE_MESH_ELEMENT(0, extend_model_1, ESP_BLE_MESH_MODEL_NONE),
 };
@@ -171,6 +177,10 @@ static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32
     ESP_LOGI(TAG, "net_idx: 0x%04x, addr: 0x%04x", net_idx, addr);
     ESP_LOGI(TAG, "flags: 0x%02x, iv_index: 0x%08"PRIx32, flags, iv_index);
     board_led_operation(LED_G, LED_OFF);
+
+    /* Now that an element address exists, the stored group can finally be
+     * subscribed. This is what restores group membership across a reboot. */
+    mesh_attr_apply_group();
 }
 
 static void example_change_led_state(esp_ble_mesh_model_t *model,
@@ -222,8 +232,12 @@ static void example_handle_gen_onoff_msg(esp_ble_mesh_model_t *model,
             esp_ble_mesh_server_model_send_msg(model, ctx,
                 ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS, sizeof(srv->state.onoff), &srv->state.onoff);
         }
+        /* The publish role picks which app-key list the stack searches; a
+         * gateway's key lives in the provisioner list, so publishing as
+         * ROLE_NODE there fails with "Invalid AppKeyIndex". */
         esp_ble_mesh_model_publish(model, ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS,
-            sizeof(srv->state.onoff), &srv->state.onoff, ROLE_NODE);
+            sizeof(srv->state.onoff), &srv->state.onoff,
+            device_mode_get() == DEVICE_MODE_GATEWAY ? ROLE_PROVISIONER : ROLE_NODE);
         example_change_led_state(model, ctx, srv->state.onoff);
         break;
     default:
@@ -254,6 +268,10 @@ static void gateway_bridge_emitf(const char *fmt, ...)
     uart_cmd_emit(line);
     spi_cmd_emit(line);
 }
+
+/* Defined below with the rest of the Config Client flow; needed here because
+ * provisioning completion is what kicks that flow off. */
+static void gateway_configure_node(uint16_t unicast);
 
 /* Gateway role: an unprovisioned device matching our UUID filter showed up,
  * queue it for provisioning straight away. */
@@ -322,6 +340,9 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
             param->provisioner_prov_complete.unicast_addr,
             param->provisioner_prov_complete.element_num,
             param->provisioner_prov_complete.netkey_idx);
+        /* Provisioned is not yet queryable -- the node still needs an app key
+         * bound to its attribute model. */
+        gateway_configure_node(param->provisioner_prov_complete.unicast_addr);
         break;
     case ESP_BLE_MESH_PROVISIONER_ADD_UNPROV_DEV_COMP_EVT:
         ESP_LOGI(TAG, "ESP_BLE_MESH_PROVISIONER_ADD_UNPROV_DEV_COMP_EVT, err_code %d",
@@ -349,6 +370,21 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
                 ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_CLI, ESP_BLE_MESH_CID_NVAL);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "failed to bind appkey to OnOff Client (err %d)", err);
+            }
+            /* Vendor models take the real company id rather than CID_NVAL.
+             * Without this the gateway cannot send a query at all. */
+            err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
+                PROV_OWN_ADDR, prov_key.app_idx,
+                MESH_ATTR_MODEL_ID_CLIENT, CID_ESP);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "failed to bind appkey to attribute Client (err %d)", err);
+            }
+            /* The server half too, so a gateway can be queried like any node. */
+            err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
+                PROV_OWN_ADDR, prov_key.app_idx,
+                MESH_ATTR_MODEL_ID_SERVER, CID_ESP);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "failed to bind appkey to attribute Server (err %d)", err);
             }
         }
         break;
@@ -528,6 +564,94 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
  * Fires when a node answers a configuration request the gateway sent while
  * bringing it into the network.
  */
+/* GROUP_ADDR is the one attribute with a side effect beyond being reported:
+ * changing it moves which multicast traffic this node actually receives. */
+static void identity_changed(dev_attr_id_t id)
+{
+    if (id == DEV_ATTR_GROUP_ADDR) {
+        mesh_attr_apply_group();
+    }
+}
+
+/* Query results reach the host on the same links commands arrive on. */
+static void attr_status_to_host(uint16_t src_addr, const char *text)
+{
+    gateway_bridge_emitf("ATTR 0x%04x%s", src_addr, text);
+}
+
+static void attr_set_status_to_host(uint16_t src_addr, uint8_t result)
+{
+    static const char *reason[] = { "OK", "UNKNOWN_ATTR", "READ_ONLY", "BAD_VALUE" };
+    gateway_bridge_emitf("ATTRSET 0x%04x %s", src_addr,
+        result < (sizeof(reason) / sizeof(reason[0])) ? reason[result] : "ERR");
+}
+
+/* Fills in the boilerplate for a Config Client request aimed at `unicast`.
+ * Config messages are secured with the node's device key, not an app key, so
+ * app_idx is left at zero here. */
+static void config_client_common(esp_ble_mesh_client_common_param_t *common,
+                                 uint16_t unicast, uint32_t opcode)
+{
+    memset(common, 0, sizeof(*common));
+    common->opcode       = opcode;
+    common->model        = config_client.model;
+    common->ctx.net_idx  = prov_key.net_idx;
+    common->ctx.app_idx  = 0x0000;
+    common->ctx.addr     = unicast;
+    common->ctx.send_ttl = ESP_BLE_MESH_TTL_DEFAULT;
+    common->ctx.send_rel = false;
+    common->msg_timeout  = 0;
+    common->msg_role     = ROLE_PROVISIONER;
+}
+
+/* A freshly provisioned node holds a network key but no app key, so it cannot
+ * decrypt anything the attribute model sends. The gateway walks it through the
+ * two steps that fix that:
+ *
+ *     APP_KEY_ADD     -> give the node the network's app key
+ *     MODEL_APP_BIND  -> bind that key to its attribute server model
+ *
+ * Composition Data is deliberately not fetched first. Every board in this
+ * network runs this same firmware, so the model layout is already known --
+ * revisit that if mixed firmware ever joins.
+ */
+static void gateway_configure_node(uint16_t unicast)
+{
+    esp_ble_mesh_client_common_param_t common;
+    esp_ble_mesh_cfg_client_set_state_t set = {0};
+
+    config_client_common(&common, unicast, ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD);
+    set.app_key_add.net_idx = prov_key.net_idx;
+    set.app_key_add.app_idx = prov_key.app_idx;
+    memcpy(set.app_key_add.app_key, prov_key.app_key, sizeof(set.app_key_add.app_key));
+
+    esp_err_t err = esp_ble_mesh_config_client_set_state(&common, &set);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "app key add to 0x%04x failed (err %d)", unicast, err);
+    } else {
+        ESP_LOGI(TAG, "configuring node 0x%04x: app key add sent", unicast);
+    }
+}
+
+static void gateway_bind_attr_model(uint16_t unicast)
+{
+    esp_ble_mesh_client_common_param_t common;
+    esp_ble_mesh_cfg_client_set_state_t set = {0};
+
+    config_client_common(&common, unicast, ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND);
+    set.model_app_bind.element_addr  = unicast;
+    set.model_app_bind.model_app_idx = prov_key.app_idx;
+    set.model_app_bind.model_id      = MESH_ATTR_MODEL_ID_SERVER;
+    set.model_app_bind.company_id    = CID_ESP;
+
+    esp_err_t err = esp_ble_mesh_config_client_set_state(&common, &set);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "attr model bind on 0x%04x failed (err %d)", unicast, err);
+    } else {
+        ESP_LOGI(TAG, "configuring node 0x%04x: attr model bind sent", unicast);
+    }
+}
+
 static void example_ble_mesh_config_client_cb(esp_ble_mesh_cfg_client_cb_event_t event,
                                               esp_ble_mesh_cfg_client_cb_param_t *param)
 {
@@ -537,8 +661,23 @@ static void example_ble_mesh_config_client_cb(esp_ble_mesh_cfg_client_cb_event_t
         return;
     }
 
+    uint16_t src = param->params->ctx.addr;
+    uint32_t opcode = param->params->opcode;
+
     ESP_LOGI(TAG, "Config Client event 0x%02x, src 0x%04x, opcode 0x%04" PRIx32,
-        event, param->params->ctx.addr, param->params->opcode);
+        event, src, opcode);
+
+    /* Advance the commissioning chain as each step is acknowledged. Timeouts
+     * arrive as ESP_BLE_MESH_CFG_CLIENT_TIMEOUT_EVT and simply stall the chain;
+     * re-provisioning the node restarts it. */
+    if (event == ESP_BLE_MESH_CFG_CLIENT_SET_STATE_EVT) {
+        if (opcode == ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD) {
+            gateway_bind_attr_model(src);
+        } else if (opcode == ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND) {
+            ESP_LOGI(TAG, "node 0x%04x is configured and queryable", src);
+            gateway_bridge_emitf("READY unicast=0x%04x", src);
+        }
+    }
 }
 
 static esp_err_t ble_mesh_init(void)
@@ -571,6 +710,19 @@ static esp_err_t ble_mesh_init(void)
 
 
 
+
+    /* Registers the custom-model callback, so it has to follow
+     * esp_ble_mesh_init(). A node needs this to answer queries at all. */
+    err = mesh_attr_model_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start attribute model (err %d)", err);
+        return err;
+    }
+    mesh_attr_model_register_cbs(attr_status_to_host, attr_set_status_to_host);
+    /* Lets the ASK verbs on the host channel reach the mesh without lib/cmd
+     * having to depend on lib/BLE. */
+    cmd_proto_register_mesh(mesh_attr_get, mesh_attr_set);
+    dev_identity_register_change_cb(identity_changed);
 
     ESP_LOGI(TAG, "BLE Mesh stack initialized");
 
@@ -673,6 +825,9 @@ static esp_err_t ble_mesh_apply_mode(device_mode_t mode)
         }
 
         broadcast_stop();
+        /* A provisioner owns PROV_OWN_ADDR from init, so unlike a node it can
+         * join its group without waiting to be provisioned. */
+        mesh_attr_apply_group();
         ESP_LOGI(TAG, "gateway active: provisioner enabled, broadcast stopped");
     } else {
         err = esp_ble_mesh_provisioner_prov_disable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
