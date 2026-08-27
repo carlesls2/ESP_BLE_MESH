@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 
 #include "dev_identity.h"
+#include "device_mode.h"
 
 #define TAG "ATTR_MDL"
 
@@ -412,11 +413,17 @@ static esp_err_t client_send(uint16_t dst, uint32_t opcode,
      * node answers unicast on its own schedule and arrives as a STATUS. */
     bool unicast = ESP_BLE_MESH_ADDR_IS_UNICAST(dst);
 
+    /* The stack keeps separate app-key lists per role. A gateway's key lives
+     * in the provisioner list, so sending as ROLE_NODE there makes the key
+     * lookup fail with "Invalid AppKeyIndex". */
+    esp_ble_mesh_dev_role_t role =
+        (device_mode_get() == DEVICE_MODE_GATEWAY) ? ROLE_PROVISIONER : ROLE_NODE;
+
     return esp_ble_mesh_client_model_send_msg(MODEL_CLIENT, &ctx, opcode,
                                               len, data,
                                               (unicast && need_rsp) ? 4000 : 0,
                                               unicast && need_rsp,
-                                              ROLE_NODE);
+                                              role);
 }
 
 esp_err_t mesh_attr_get(uint16_t dst, const dev_attr_id_t *ids, size_t id_count)

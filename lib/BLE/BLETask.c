@@ -232,8 +232,12 @@ static void example_handle_gen_onoff_msg(esp_ble_mesh_model_t *model,
             esp_ble_mesh_server_model_send_msg(model, ctx,
                 ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS, sizeof(srv->state.onoff), &srv->state.onoff);
         }
+        /* The publish role picks which app-key list the stack searches; a
+         * gateway's key lives in the provisioner list, so publishing as
+         * ROLE_NODE there fails with "Invalid AppKeyIndex". */
         esp_ble_mesh_model_publish(model, ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS,
-            sizeof(srv->state.onoff), &srv->state.onoff, ROLE_NODE);
+            sizeof(srv->state.onoff), &srv->state.onoff,
+            device_mode_get() == DEVICE_MODE_GATEWAY ? ROLE_PROVISIONER : ROLE_NODE);
         example_change_led_state(model, ctx, srv->state.onoff);
         break;
     default:

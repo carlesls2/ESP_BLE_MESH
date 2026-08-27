@@ -25,3 +25,7 @@ CONFIG_BLE_MESH_TX_SEG_MSG_COUNT=10
 CONFIG_BLE_MESH_RX_SEG_MSG_COUNT=10
 CONFIG_BLE_MESH_CFG_CLI=y
 CONFIG_BLE_MESH_GENERIC_ONOFF_CLI=y
+# Persist mesh state (node: unicast/NetKey/AppKey/bindings; gateway: the
+# provisioned-node table and its keys). Without this every reboot comes back
+# with an empty key list and sends fail with "Invalid AppKeyIndex".
+CONFIG_BLE_MESH_SETTINGS=y
