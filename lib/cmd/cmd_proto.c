@@ -159,13 +159,16 @@ static void set_local_attr(cmd_proto_ctx_t *ctx, const char *args)
     }
 }
 
-static cmd_mesh_get_fn s_mesh_get = NULL;
-static cmd_mesh_set_fn s_mesh_set = NULL;
+static cmd_mesh_get_fn  s_mesh_get = NULL;
+static cmd_mesh_set_fn  s_mesh_set = NULL;
+static cmd_mesh_send_fn s_mesh_send = NULL;
 
-void cmd_proto_register_mesh(cmd_mesh_get_fn get_fn, cmd_mesh_set_fn set_fn)
+void cmd_proto_register_mesh(cmd_mesh_get_fn get_fn, cmd_mesh_set_fn set_fn,
+                             cmd_mesh_send_fn send_fn)
 {
     s_mesh_get = get_fn;
     s_mesh_set = set_fn;
+    s_mesh_send = send_fn;
 }
 
 /* "ALL" targets the all-nodes broadcast address; anything else is parsed as an
@@ -289,6 +292,111 @@ static void ask_query(cmd_proto_ctx_t *ctx, const char *args)
     }
 }
 
+/* SEND <target> <text> -- free text to a node's console/host link. */
+static void send_text(cmd_proto_ctx_t *ctx, const char *args)
+{
+    char        target[16];
+    const char *text = NULL;
+
+    if (s_mesh_send == NULL) {
+        reply(ctx, "ERR mesh not available");
+        return;
+    }
+    if (!split_token(args, target, sizeof(target), &text) || *text == '\0') {
+        reply(ctx, "ERR usage: SEND <addr|ALL> <text>");
+        return;
+    }
+
+    uint16_t dst;
+    if (!parse_target(target, &dst)) {
+        reply(ctx, "ERR bad address");
+        return;
+    }
+
+    esp_err_t err = s_mesh_send(dst, text);
+    if (err == ESP_OK) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "SEND 0x%04x %u chars sent",
+                 dst, (unsigned)strlen(text));
+        reply(ctx, msg);
+    } else if (err == ESP_ERR_INVALID_SIZE) {
+        reply(ctx, "ERR text too long");
+    } else {
+        mesh_err_reply(ctx, err);
+    }
+}
+
+/* --- Help menu ------------------------------------------------------------ */
+
+/* One row per command form. A verb may span several rows (ASK does); HELP with
+ * that verb prints them all. New commands only need a row here to show up. */
+typedef struct {
+    const char *verb;
+    const char *usage;
+    const char *desc;
+} cmd_help_row_t;
+
+static const cmd_help_row_t s_help_rows[] = {
+    { "MODE", "MODE [GATEWAY|NODE]",              "show or switch the device role" },
+    { "ID",   "ID? | ID GET <attr>",              "read local identity attributes" },
+    { "ID",   "ID SET <attr> <value>",            "write a local identity attribute" },
+    { "ASK",  "ASK <addr|ALL> [attr ...]",        "query attributes of remote nodes (gateway)" },
+    { "ASK",  "ASK SET <addr> <attr> <value>",    "write an attribute on a remote node (gateway)" },
+    { "SEND", "SEND <addr|ALL> <text>",           "send text to remote nodes (gateway)" },
+    { "HELP", "HELP [command] | <command> --help", "show this menu" },
+};
+
+/* Appends every known attribute name to the menu so "ID SET <attr>" is usable
+ * without reading the source. Wraps onto extra lines if the table outgrows one. */
+static void report_help_attrs(cmd_proto_ctx_t *ctx)
+{
+    char   line[CMD_PROTO_MAX_LINE];
+    size_t used = (size_t)snprintf(line, sizeof(line), "HELP attrs:");
+
+    for (size_t i = 0; i < dev_attr_count(); i++) {
+        const char *name = dev_attr_at(i)->name;
+        int n = snprintf(line + used, sizeof(line) - used, " %s", name);
+        if (n <= 0 || (size_t)n >= sizeof(line) - used) {
+            reply(ctx, line);
+            used = (size_t)snprintf(line, sizeof(line), "HELP attrs: %s", name);
+            continue;
+        }
+        used += n;
+    }
+    reply(ctx, line);
+}
+
+/* `what` narrows the menu to one verb ("SEND", or a full line like "ASK SET"
+ * whose first token decides); NULL or an unknown verb prints everything. */
+static void report_help(cmd_proto_ctx_t *ctx, const char *what)
+{
+    char        verb[16] = "";
+    const char *ignored = NULL;
+    bool        matched = false;
+
+    if (what != NULL) {
+        split_token(what, verb, sizeof(verb), &ignored);
+    }
+
+    for (size_t pass = 0; pass < 2 && !matched; pass++) {
+        for (size_t i = 0; i < sizeof(s_help_rows) / sizeof(s_help_rows[0]); i++) {
+            const cmd_help_row_t *row = &s_help_rows[i];
+            if (pass == 0 && verb[0] != '\0' && strcasecmp(row->verb, verb) != 0) {
+                continue;
+            }
+            char msg[CMD_PROTO_MAX_LINE];
+            snprintf(msg, sizeof(msg), "HELP %-33s %s", row->usage, row->desc);
+            reply(ctx, msg);
+            matched = true;
+        }
+        /* Unknown verb: fall through to the full menu rather than an error,
+         * since whoever asked clearly wants orientation. */
+        verb[0] = '\0';
+    }
+
+    report_help_attrs(ctx);
+}
+
 static void handle_line(cmd_proto_ctx_t *ctx, char *line)
 {
     /* Trim surrounding whitespace; a monitor may send stray spaces. */
@@ -303,9 +411,25 @@ static void handle_line(cmd_proto_ctx_t *ctx, char *line)
         return;
     }
 
+    /* "<command> --help" reads like HELP <command>; strip the flag and route
+     * both spellings through the same menu. */
+    if (n > 7 && strcasecmp(line + n - 7, " --help") == 0) {
+        n -= 7;
+        line[n] = '\0';
+        while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t')) {
+            line[--n] = '\0';
+        }
+        report_help(ctx, line);
+        return;
+    }
+
     const char *rest = NULL;
 
-    if (line_is(line, "MODE GATEWAY")) {
+    if (line_is(line, "HELP") || line_is(line, "--help") || line_is(line, "?")) {
+        report_help(ctx, NULL);
+    } else if (line_starts_with(line, "HELP", &rest)) {
+        report_help(ctx, rest);
+    } else if (line_is(line, "MODE GATEWAY")) {
         apply_mode(ctx, DEVICE_MODE_GATEWAY);
     } else if (line_is(line, "MODE NODE")) {
         apply_mode(ctx, DEVICE_MODE_NODE);
@@ -321,8 +445,10 @@ static void handle_line(cmd_proto_ctx_t *ctx, char *line)
         ask_remote_set(ctx, rest);
     } else if (line_starts_with(line, "ASK", &rest)) {
         ask_query(ctx, rest);
+    } else if (line_starts_with(line, "SEND", &rest)) {
+        send_text(ctx, rest);
     } else {
-        reply(ctx, "ERR unknown command (MODE / ID? / ID GET|SET / ASK <addr|ALL> [attr] / ASK SET <addr> <attr> <val>)");
+        reply(ctx, "ERR unknown command (try HELP)");
     }
 }
 

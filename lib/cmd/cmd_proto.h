@@ -7,9 +7,11 @@
  *
  *   ASCII, line terminated by CR and/or LF -- meant to be typed straight into
  *   the PlatformIO monitor:
- *       MODE GATEWAY
- *       MODE NODE
- *       MODE?
+ *       MODE GATEWAY / MODE NODE / MODE?
+ *       ID? / ID GET <attr> / ID SET <attr> <value>
+ *       ASK <addr|ALL> [attr ...] / ASK SET <addr> <attr> <value>
+ *       SEND <addr|ALL> <text>
+ *       HELP [command]      ("--help" and "<command> --help" work too)
  *
  *   Binary, 2 bytes, for a host driving SPI:
  *       A5 01   become gateway
@@ -47,7 +49,7 @@ extern "C" {
 
 /* Longest line we will buffer before giving up and resyncing. Sized for the
  * longest verb plus a maximum-length attribute value, e.g.
- * "ASK SET 0xC001 NAME <31 chars>". */
+ * "ASK SET 0xC001 NAME <31 chars>", and for "SEND 0xC001 <80 chars>". */
 #define CMD_PROTO_MAX_LINE 96
 
 /* How a transport sends a reply back to whoever issued the command. */
@@ -72,8 +74,10 @@ void cmd_proto_ctx_init(cmd_proto_ctx_t *ctx, const char *tag, cmd_proto_reply_f
  * callback in device_mode.h. */
 typedef esp_err_t (*cmd_mesh_get_fn)(uint16_t dst, const dev_attr_id_t *ids, size_t id_count);
 typedef esp_err_t (*cmd_mesh_set_fn)(uint16_t dst, dev_attr_id_t id, const char *text);
+typedef esp_err_t (*cmd_mesh_send_fn)(uint16_t dst, const char *text);
 
-void cmd_proto_register_mesh(cmd_mesh_get_fn get_fn, cmd_mesh_set_fn set_fn);
+void cmd_proto_register_mesh(cmd_mesh_get_fn get_fn, cmd_mesh_set_fn set_fn,
+                             cmd_mesh_send_fn send_fn);
 
 /* Feed received bytes. Complete commands are executed as they are recognised;
  * partial input is retained until the rest arrives. */

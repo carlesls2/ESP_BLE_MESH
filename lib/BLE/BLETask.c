@@ -603,6 +603,17 @@ static void attr_set_status_to_host(uint16_t src_addr, uint8_t result)
         result < (sizeof(reason) / sizeof(reason[0])) ? reason[result] : "ERR");
 }
 
+/* A SEND from the gateway landed here. Unlike the bridge lines this is not
+ * gateway-gated: the text is addressed to THIS device, so it goes out to
+ * whatever host or monitor is attached, in either role. */
+static void attr_text_to_host(uint16_t src_addr, const char *text)
+{
+    char line[MESH_ATTR_MSG_MAX_LEN + 16];
+    snprintf(line, sizeof(line), "TEXT 0x%04x %s", src_addr, text);
+    uart_cmd_emit(line);
+    spi_cmd_emit(line);
+}
+
 /* Fills in the boilerplate for a Config Client request aimed at `unicast`.
  * Config messages are secured with the node's device key, not an app key, so
  * app_idx is left at zero here. */
@@ -739,10 +750,11 @@ static esp_err_t ble_mesh_init(void)
         ESP_LOGE(TAG, "Failed to start attribute model (err %d)", err);
         return err;
     }
-    mesh_attr_model_register_cbs(attr_status_to_host, attr_set_status_to_host);
-    /* Lets the ASK verbs on the host channel reach the mesh without lib/cmd
-     * having to depend on lib/BLE. */
-    cmd_proto_register_mesh(mesh_attr_get, mesh_attr_set);
+    mesh_attr_model_register_cbs(attr_status_to_host, attr_set_status_to_host,
+                                 attr_text_to_host);
+    /* Lets the ASK and SEND verbs on the host channel reach the mesh without
+     * lib/cmd having to depend on lib/BLE. */
+    cmd_proto_register_mesh(mesh_attr_get, mesh_attr_set, mesh_attr_send_text);
     dev_identity_register_change_cb(identity_changed);
 
     ESP_LOGI(TAG, "BLE Mesh stack initialized");

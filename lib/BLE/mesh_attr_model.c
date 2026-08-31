@@ -25,6 +25,7 @@
 #define OP_ATTR_STATUS     ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_STATUS,     CID_ESP)
 #define OP_ATTR_SET        ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_SET,        CID_ESP)
 #define OP_ATTR_SET_STATUS ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_SET_STATUS, CID_ESP)
+#define OP_ATTR_MSG        ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_MSG,        CID_ESP)
 
 /* Longest id list a GET may carry. Past this, asking for everything (count 0)
  * is cheaper anyway. */
@@ -55,6 +56,7 @@ typedef struct {
 static esp_ble_mesh_model_op_t s_server_ops[] = {
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_GET, 1),
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_SET, 3),
+    ESP_BLE_MESH_MODEL_OP(OP_ATTR_MSG, 1),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
@@ -87,12 +89,15 @@ esp_ble_mesh_model_t mesh_attr_vnd_models[MESH_ATTR_VND_MODEL_COUNT] = {
 static QueueHandle_t             s_reply_q = NULL;
 static mesh_attr_status_cb_t     s_status_cb = NULL;
 static mesh_attr_set_status_cb_t s_set_status_cb = NULL;
+static mesh_attr_text_cb_t       s_text_cb = NULL;
 
 void mesh_attr_model_register_cbs(mesh_attr_status_cb_t status_cb,
-                                  mesh_attr_set_status_cb_t set_status_cb)
+                                  mesh_attr_set_status_cb_t set_status_cb,
+                                  mesh_attr_text_cb_t text_cb)
 {
     s_status_cb = status_cb;
     s_set_status_cb = set_status_cb;
+    s_text_cb = text_cb;
 }
 
 /* --- Server side: answering ---------------------------------------------- */
@@ -218,6 +223,25 @@ static void handle_set(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg, uint16_t
                                        sizeof(result), &result);
 }
 
+/* The wire carries the text with no terminator; rebuild a C string before
+ * handing it up. Anything past the advertised maximum is truncated rather than
+ * dropped, so a chatty sender still gets most of the line through. */
+static void handle_msg(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg, uint16_t len)
+{
+    char text[MESH_ATTR_MSG_MAX_LEN + 1];
+
+    if (len > MESH_ATTR_MSG_MAX_LEN) {
+        len = MESH_ATTR_MSG_MAX_LEN;
+    }
+    memcpy(text, msg, len);
+    text[len] = '\0';
+
+    ESP_LOGI(TAG, "text from 0x%04x: %s", ctx->addr, text);
+    if (s_text_cb) {
+        s_text_cb(ctx->addr, text);
+    }
+}
+
 /* --- Client side: receiving answers -------------------------------------- */
 
 /* Renders a TLV reply as one host-readable line: NAME=x FW_VER=y ... */
@@ -275,6 +299,8 @@ static void model_cb(esp_ble_mesh_model_cb_event_t event,
             handle_get(ctx, msg, len);
         } else if (opcode == OP_ATTR_SET) {
             handle_set(ctx, msg, len);
+        } else if (opcode == OP_ATTR_MSG) {
+            handle_msg(ctx, msg, len);
         } else if (opcode == OP_ATTR_STATUS) {
             handle_status(ctx, msg, len);
         } else if (opcode == OP_ATTR_SET_STATUS) {
@@ -478,4 +504,16 @@ esp_err_t mesh_attr_set(uint16_t dst, dev_attr_id_t id, const char *text)
 
     ESP_LOGI(TAG, "setting %s on 0x%04x", desc->name, dst);
     return client_send(dst, OP_ATTR_SET, body, (uint16_t)offset, true);
+}
+
+esp_err_t mesh_attr_send_text(uint16_t dst, const char *text)
+{
+    size_t len = text ? strlen(text) : 0;
+    if (len == 0 || len > MESH_ATTR_MSG_MAX_LEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ESP_LOGI(TAG, "sending %u chars to 0x%04x", (unsigned)len, dst);
+    /* Fire-and-forget: no status opcode pairs with MSG, so never wait. */
+    return client_send(dst, OP_ATTR_MSG, (uint8_t *)text, (uint16_t)len, false);
 }

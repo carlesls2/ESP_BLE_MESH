@@ -42,6 +42,12 @@ extern "C" {
 #define MESH_ATTR_OP_B0_STATUS     0x11
 #define MESH_ATTR_OP_B0_SET        0x12
 #define MESH_ATTR_OP_B0_SET_STATUS 0x13
+#define MESH_ATTR_OP_B0_MSG        0x14  /* free text, gateway -> node(s) */
+
+/* Longest text a MSG may carry. Segments on the air past 8 bytes, same as a
+ * full attribute reply; the bound exists so the receive side can use a fixed
+ * stack buffer. */
+#define MESH_ATTR_MSG_MAX_LEN 80
 
 /* Result codes carried by ATTR_SET_STATUS. */
 #define MESH_ATTR_RESULT_OK          0x00
@@ -53,6 +59,8 @@ extern "C" {
  * one-line summary suitable for handing straight to the host bridge. */
 typedef void (*mesh_attr_status_cb_t)(uint16_t src_addr, const char *text);
 typedef void (*mesh_attr_set_status_cb_t)(uint16_t src_addr, uint8_t result);
+/* A free-text MSG arrived for this node. `text` is NUL-terminated. */
+typedef void (*mesh_attr_text_cb_t)(uint16_t src_addr, const char *text);
 
 /* The vendor models, to drop into an element's vendor slot:
  *
@@ -68,7 +76,8 @@ extern esp_ble_mesh_model_t mesh_attr_vnd_models[MESH_ATTR_VND_MODEL_COUNT];
 esp_err_t mesh_attr_model_init(void);
 
 void mesh_attr_model_register_cbs(mesh_attr_status_cb_t status_cb,
-                                  mesh_attr_set_status_cb_t set_status_cb);
+                                  mesh_attr_set_status_cb_t set_status_cb,
+                                  mesh_attr_text_cb_t text_cb);
 
 /* --- Gateway side -------------------------------------------------------- */
 
@@ -81,6 +90,11 @@ esp_err_t mesh_attr_get(uint16_t dst, const dev_attr_id_t *ids, size_t id_count)
 /* Writes one attribute on `dst`. Refused at the far end unless the attribute
  * carries DEV_ATTR_FLAG_REMOTE. */
 esp_err_t mesh_attr_set(uint16_t dst, dev_attr_id_t id, const char *text);
+
+/* Sends a free-text message to `dst` (unicast, group, or 0xFFFF for all).
+ * Unacknowledged: delivery shows up on the receiving node's host link, not
+ * here. ESP_ERR_INVALID_SIZE if the text is empty or too long. */
+esp_err_t mesh_attr_send_text(uint16_t dst, const char *text);
 
 /* --- Group membership ---------------------------------------------------- */
 
