@@ -320,6 +320,15 @@ esp_err_t mesh_attr_model_init(void)
         return err;
     }
 
+    /* Vendor client models are not initialized by the stack the way SIG
+     * clients are: without this call the model has no internal data and
+     * every send fails with "Invalid client internal data" (-EINVAL). */
+    err = esp_ble_mesh_client_model_init(MODEL_CLIENT);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to init attribute client model: %d", err);
+        return err;
+    }
+
     ESP_LOGI(TAG, "attribute model ready (%u attributes)", (unsigned)dev_attr_count());
     return ESP_OK;
 }

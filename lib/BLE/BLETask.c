@@ -300,6 +300,42 @@ static void gateway_recv_unprov_adv_pkt(uint8_t uuid[16], uint8_t addr[BD_ADDR_L
     }
 }
 
+/* Binds the gateway's app key to every local model that speaks it. Runs when
+ * the key is first created and again on reboots that restore it from NVS --
+ * binding an already-bound model is harmless. */
+static void gateway_bind_local_models(void)
+{
+    /* Bind to both local clients so the gateway can configure nodes and
+     * drive their OnOff state. */
+    esp_err_t err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
+        PROV_OWN_ADDR, prov_key.app_idx,
+        ESP_BLE_MESH_MODEL_ID_CONFIG_CLI, ESP_BLE_MESH_CID_NVAL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to bind appkey to Config Client (err %d)", err);
+    }
+    err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
+        PROV_OWN_ADDR, prov_key.app_idx,
+        ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_CLI, ESP_BLE_MESH_CID_NVAL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to bind appkey to OnOff Client (err %d)", err);
+    }
+    /* Vendor models take the real company id rather than CID_NVAL.
+     * Without this the gateway cannot send a query at all. */
+    err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
+        PROV_OWN_ADDR, prov_key.app_idx,
+        MESH_ATTR_MODEL_ID_CLIENT, CID_ESP);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to bind appkey to attribute Client (err %d)", err);
+    }
+    /* The server half too, so a gateway can be queried like any node. */
+    err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
+        PROV_OWN_ADDR, prov_key.app_idx,
+        MESH_ATTR_MODEL_ID_SERVER, CID_ESP);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to bind appkey to attribute Server (err %d)", err);
+    }
+}
+
 static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
                                              esp_ble_mesh_prov_cb_param_t *param)
 {
@@ -357,35 +393,16 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
             param->provisioner_add_app_key_comp.err_code);
         if (param->provisioner_add_app_key_comp.err_code == ESP_OK) {
             prov_key.app_idx = param->provisioner_add_app_key_comp.app_idx;
-            /* Bind to both local clients so the gateway can configure nodes and
-             * drive their OnOff state. */
-            esp_err_t err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
-                PROV_OWN_ADDR, prov_key.app_idx,
-                ESP_BLE_MESH_MODEL_ID_CONFIG_CLI, ESP_BLE_MESH_CID_NVAL);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "failed to bind appkey to Config Client (err %d)", err);
-            }
-            err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
-                PROV_OWN_ADDR, prov_key.app_idx,
-                ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_CLI, ESP_BLE_MESH_CID_NVAL);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "failed to bind appkey to OnOff Client (err %d)", err);
-            }
-            /* Vendor models take the real company id rather than CID_NVAL.
-             * Without this the gateway cannot send a query at all. */
-            err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
-                PROV_OWN_ADDR, prov_key.app_idx,
-                MESH_ATTR_MODEL_ID_CLIENT, CID_ESP);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "failed to bind appkey to attribute Client (err %d)", err);
-            }
-            /* The server half too, so a gateway can be queried like any node. */
-            err = esp_ble_mesh_provisioner_bind_app_key_to_local_model(
-                PROV_OWN_ADDR, prov_key.app_idx,
-                MESH_ATTR_MODEL_ID_SERVER, CID_ESP);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "failed to bind appkey to attribute Server (err %d)", err);
-            }
+            gateway_bind_local_models();
+        } else if (esp_ble_mesh_provisioner_get_local_app_key(
+                       ESP_BLE_MESH_NET_PRIMARY, APP_KEY_IDX) != NULL) {
+            /* The add was refused because the key already lives in the stack,
+             * restored from NVS by an earlier gateway run. The bindings are not
+             * restored with it, so redo them or every send would fail with an
+             * unbound client after a reboot. */
+            ESP_LOGI(TAG, "app key already present, rebinding local models");
+            prov_key.app_idx = APP_KEY_IDX;
+            gateway_bind_local_models();
         }
         break;
     case ESP_BLE_MESH_PROVISIONER_BIND_APP_KEY_TO_MODEL_COMP_EVT:
@@ -698,13 +715,17 @@ static esp_err_t ble_mesh_init(void)
         return err;
     }
 
-    /* The node role is always available so the device can still be provisioned
-     * by someone else; the provisioner role is enabled on demand in
-     * ble_mesh_apply_mode(). */
-    err = esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable mesh node (err %d)", err);
-        return err;
+    /* Enabling node provisioning claims the node role and stores it in NVS,
+     * and the provisioner refuses to start while it is held (see
+     * ble_mesh_apply_mode). So a device that will come up as gateway must not
+     * take it; every other device stays provisionable by someone else. */
+    if (device_mode_get() != DEVICE_MODE_GATEWAY) {
+        err = esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+        if (err != ESP_OK) {
+            /* Keep going: the mesh stack itself is up, and the role juggling
+             * in ble_mesh_apply_mode() may still recover. */
+            ESP_LOGE(TAG, "Failed to enable mesh node (err %d)", err);
+        }
     }
 
 
@@ -793,6 +814,22 @@ static esp_err_t ble_mesh_apply_mode(device_mode_t mode)
     esp_err_t err;
 
     if (mode == DEVICE_MODE_GATEWAY) {
+        /* The stack allows one role at a time and stores it in NVS: with node
+         * provisioning active (enabled at init, or restored after a reboot)
+         * esp_ble_mesh_provisioner_prov_enable() is refused with "Mismatch
+         * role". Drop the node role first. A device that already joined some
+         * other network as a node has to leave it before it can provision. */
+        if (esp_ble_mesh_node_is_provisioned()) {
+            ESP_LOGW(TAG, "leaving current network to become gateway");
+            esp_ble_mesh_node_local_reset();
+        }
+        err = esp_ble_mesh_node_prov_disable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+        if (err != ESP_OK) {
+            /* Not fatal: already disabled is the usual cause after a reboot
+             * straight into gateway mode. */
+            ESP_LOGW(TAG, "node prov disable: %s", esp_err_to_name(err));
+        }
+
         /* Only report unprovisioned devices whose UUID starts 0xdd 0xdd, which
          * is what this firmware advertises as a node (see dev_uuid). */
         static const uint8_t match[2] = { 0xdd, 0xdd };
@@ -835,6 +872,14 @@ static esp_err_t ble_mesh_apply_mode(device_mode_t mode)
             /* INVALID_STATE just means it was never enabled -- fine at boot. */
             ESP_LOGE(TAG, "failed to disable provisioner (err %d)", err);
             return err;
+        }
+
+        /* Mirror of the gateway branch: reclaim the node role so the device
+         * can be provisioned (again). Redundant at first boot, where init
+         * already enabled it, and after a reboot into node mode. */
+        err = esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "node prov enable: %s", esp_err_to_name(err));
         }
 
         random_delay(broadcast_group_cb, NULL);
