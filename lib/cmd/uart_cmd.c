@@ -2,6 +2,7 @@
 
 #include "uart_cmd.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/uart.h"
@@ -33,8 +34,23 @@ void uart_cmd_emit(const char *text)
     if (!s_ready || text == NULL) {
         return;
     }
-    uart_write_bytes(UART_CMD_PORT, text, strlen(text));
-    uart_write_bytes(UART_CMD_PORT, "\r\n", 2);
+
+    /* Written through stdout in ONE call, rather than via uart_write_bytes().
+     *
+     * ESP_LOG reaches UART0 through stdout's vprintf; uart_write_bytes() is a
+     * separate path to the same peripheral. With two independent writers a log
+     * line lands *inside* a reply -- observed in the wild as
+     *
+     *     HELP NODES        list nodes...
+     *     HI (11376) EXAMPLE: BLE Mesh running as GATEWAY
+     *     ELP HELP [command] ...
+     *
+     * which corrupts both lines and cannot be repaired by any filtering at the
+     * host end. Going through stdout makes this share the FILE lock that
+     * vprintf takes, so emits and log lines interleave only at line
+     * boundaries, which the host filter does handle. */
+    printf("%s\r\n", text);
+    fflush(stdout);
 }
 
 bool uart_cmd_ready(void)

@@ -38,11 +38,45 @@ extern "C" {
 
 /* Opcode low bytes; the full 3-byte opcodes are built in the .c with
  * ESP_BLE_MESH_MODEL_OP_3(b0, CID_ESP). */
-#define MESH_ATTR_OP_B0_GET        0x10
-#define MESH_ATTR_OP_B0_STATUS     0x11
-#define MESH_ATTR_OP_B0_SET        0x12
-#define MESH_ATTR_OP_B0_SET_STATUS 0x13
-#define MESH_ATTR_OP_B0_MSG        0x14  /* free text, gateway -> node(s) */
+#define MESH_ATTR_OP_B0_GET          0x10
+#define MESH_ATTR_OP_B0_STATUS       0x11
+#define MESH_ATTR_OP_B0_SET          0x12
+#define MESH_ATTR_OP_B0_SET_STATUS   0x13
+#define MESH_ATTR_OP_B0_MSG          0x14  /* free text, gateway -> node(s) */
+#define MESH_ATTR_OP_B0_TELEM_GET    0x15  /* no payload */
+#define MESH_ATTR_OP_B0_TELEM_STATUS 0x16  /* one mesh_telem_t */
+
+/* --- Telemetry fast path -------------------------------------------------
+ *
+ * Asking for every vital as TLV attributes costs 2 header bytes per value and
+ * runs to ~155 bytes, which segments into 13 blocks. The same data packed into
+ * the struct below is 21 bytes -- still segmented, but into 2. That is the
+ * whole reason this opcode pair exists next to ATTR_GET; use TELEM for the
+ * routine "how is everyone doing" sweep and ATTR_GET when you want a named
+ * subset or the stored identity fields alongside.
+ *
+ * Little-endian on the wire, matching the TLV convention and the CPU, so the
+ * struct is memcpy'd rather than field-by-field encoded. `ver` leads so a
+ * gateway meeting an older or newer node can say so instead of misparsing. */
+#define MESH_TELEM_VER 1
+
+/* Flags byte. */
+#define MESH_TELEM_FLAG_GATEWAY    (1u << 0)
+#define MESH_TELEM_FLAG_BATT_VALID (1u << 1)
+#define MESH_TELEM_FLAG_RSSI_VALID (1u << 2)
+
+typedef struct __attribute__((packed)) {
+    uint8_t  ver;           /* MESH_TELEM_VER */
+    uint16_t unicast;       /* 0x0000 while unprovisioned */
+    uint32_t uptime_s;
+    uint32_t free_heap;
+    uint32_t min_free_heap;
+    uint16_t batt_mv;
+    uint8_t  batt_pct;
+    int8_t   rssi;          /* of the last mesh message the node heard */
+    uint8_t  reset_reason;  /* esp_reset_reason_t */
+    uint8_t  flags;         /* MESH_TELEM_FLAG_* */
+} mesh_telem_t;
 
 /* Longest text a MSG may carry. Segments on the air past 8 bytes, same as a
  * full attribute reply; the bound exists so the receive side can use a fixed
@@ -61,6 +95,9 @@ typedef void (*mesh_attr_status_cb_t)(uint16_t src_addr, const char *text);
 typedef void (*mesh_attr_set_status_cb_t)(uint16_t src_addr, uint8_t result);
 /* A free-text MSG arrived for this node. `text` is NUL-terminated. */
 typedef void (*mesh_attr_text_cb_t)(uint16_t src_addr, const char *text);
+/* A node answered a TELEM_GET. `telem` is validated and byte-order corrected;
+ * it points at stack memory, so copy anything you need to keep. */
+typedef void (*mesh_attr_telem_cb_t)(uint16_t src_addr, const mesh_telem_t *telem);
 
 /* The vendor models, to drop into an element's vendor slot:
  *
@@ -77,7 +114,8 @@ esp_err_t mesh_attr_model_init(void);
 
 void mesh_attr_model_register_cbs(mesh_attr_status_cb_t status_cb,
                                   mesh_attr_set_status_cb_t set_status_cb,
-                                  mesh_attr_text_cb_t text_cb);
+                                  mesh_attr_text_cb_t text_cb,
+                                  mesh_attr_telem_cb_t telem_cb);
 
 /* --- Gateway side -------------------------------------------------------- */
 
@@ -86,6 +124,11 @@ void mesh_attr_model_register_cbs(mesh_attr_status_cb_t status_cb,
  * request reaches every subscriber and each replies unicast after its own
  * random delay. */
 esp_err_t mesh_attr_get(uint16_t dst, const dev_attr_id_t *ids, size_t id_count);
+
+/* Asks `dst` for one packed telemetry snapshot. Same addressing rules as
+ * mesh_attr_get: unicast, group, or 0xFFFF for everyone, with group replies
+ * staggered. Answers arrive on the telem callback. */
+esp_err_t mesh_telem_get(uint16_t dst);
 
 /* Writes one attribute on `dst`. Refused at the far end unless the attribute
  * carries DEV_ATTR_FLAG_REMOTE. */

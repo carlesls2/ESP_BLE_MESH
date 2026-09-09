@@ -11,6 +11,8 @@
  *       ID? / ID GET <attr> / ID SET <attr> <value>
  *       ASK <addr|ALL> [attr ...] / ASK SET <addr> <attr> <value>
  *       SEND <addr|ALL> <text>
+ *       TELEM <addr|ALL>    live vitals, packed (see mesh_attr_model.h)
+ *       NODES               who this gateway has provisioned
  *       HELP [command]      ("--help" and "<command> --help" work too)
  *
  *   Binary, 2 bytes, for a host driving SPI:
@@ -67,17 +69,35 @@ typedef struct {
 
 void cmd_proto_ctx_init(cmd_proto_ctx_t *ctx, const char *tag, cmd_proto_reply_fn reply);
 
-/* The ASK verbs reach the mesh through these, registered by the BLE layer.
- * Inverting the dependency this way keeps lib/cmd free of lib/BLE, which
- * already includes uart_cmd.h and spi_cmd.h -- a direct call the other way
- * would make the two libraries mutually dependent. Same shape as the apply
- * callback in device_mode.h. */
+/* The ASK, TELEM and NODES verbs reach the mesh through these, registered by
+ * the BLE layer. Inverting the dependency this way keeps lib/cmd free of
+ * lib/BLE, which already includes uart_cmd.h and spi_cmd.h -- a direct call the
+ * other way would make the two libraries mutually dependent. Same shape as the
+ * apply callback in device_mode.h. */
 typedef esp_err_t (*cmd_mesh_get_fn)(uint16_t dst, const dev_attr_id_t *ids, size_t id_count);
 typedef esp_err_t (*cmd_mesh_set_fn)(uint16_t dst, dev_attr_id_t id, const char *text);
 typedef esp_err_t (*cmd_mesh_send_fn)(uint16_t dst, const char *text);
+typedef esp_err_t (*cmd_mesh_telem_fn)(uint16_t dst);
 
-void cmd_proto_register_mesh(cmd_mesh_get_fn get_fn, cmd_mesh_set_fn set_fn,
-                             cmd_mesh_send_fn send_fn);
+/* Enumeration is answered synchronously out of the provisioner's own node
+ * table, so unlike the query verbs it writes straight back to whoever asked
+ * rather than going out on the bridge to every transport. `emit` is the
+ * issuing transport's reply hook, and may be called any number of times. */
+typedef esp_err_t (*cmd_mesh_nodes_fn)(cmd_proto_reply_fn emit);
+
+/* Grouped into a struct rather than passed positionally: five bare function
+ * pointers at one call site is a swap waiting to happen, and the compiler
+ * cannot catch it when several share a signature. */
+typedef struct {
+    cmd_mesh_get_fn   get;
+    cmd_mesh_set_fn   set;
+    cmd_mesh_send_fn  send;
+    cmd_mesh_telem_fn telem;
+    cmd_mesh_nodes_fn nodes;
+} cmd_mesh_ops_t;
+
+/* `ops` is stored by pointer and must outlive registration -- pass a static. */
+void cmd_proto_register_mesh(const cmd_mesh_ops_t *ops);
 
 /* Feed received bytes. Complete commands are executed as they are recognised;
  * partial input is retained until the rest arrives. */

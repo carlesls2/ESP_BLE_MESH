@@ -9,7 +9,9 @@
 #include "dev_identity.h"
 #include "device_mode.h"
 #include "spi_cmd.h"
+#include "telemetry.h"
 #include "uart_cmd.h"
+#include "uart2_cmd.h"
 
 #define TAG "MAIN"
 
@@ -29,6 +31,10 @@ void app_main()
 
 	ESP_ERROR_CHECK(device_mode_init());
 
+	/* Telemetry first: it registers the providers behind the dynamic attribute
+	 * rows, so dev_identity_init() can print them in its boot summary. */
+	ESP_ERROR_CHECK(telemetry_init());
+
 	/* Identity is loaded before the mesh starts so a query arriving immediately
 	 * after provisioning already has something to answer with. */
 	ESP_ERROR_CHECK(dev_identity_init());
@@ -39,6 +45,9 @@ void app_main()
 	 * still drive the switch. */
 	if (uart_cmd_init() != ESP_OK) {
 		ESP_LOGE(TAG, "UART command channel unavailable");
+	}
+	if (uart2_cmd_init() != ESP_OK) {
+		ESP_LOGE(TAG, "UART2 (Pi) command channel unavailable");
 	}
 	if (spi_cmd_init() != ESP_OK) {
 		ESP_LOGE(TAG, "SPI command channel unavailable");

@@ -9,7 +9,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "cmd_proto.h"
@@ -33,11 +33,16 @@
 #define SPI_CMD_TASK_STK  3072
 #define SPI_CMD_TASK_PRI  10
 
-static cmd_proto_ctx_t   s_ctx;
-static bool              s_ready = false;
-static uint8_t          *s_rx_buf = NULL;
-static uint8_t          *s_tx_buf = NULL;
-static SemaphoreHandle_t s_tx_lock = NULL;
+/* Reply lines wait here until the host clocks a transaction for each. Deep
+ * enough for the longest multi-line reply (HELP) plus a few async bridge
+ * lines; on overflow the newest line is dropped with a warning. */
+#define SPI_CMD_TX_QUEUE_LEN 16
+
+static cmd_proto_ctx_t s_ctx;
+static bool            s_ready = false;
+static uint8_t        *s_rx_buf = NULL;
+static uint8_t        *s_tx_buf = NULL;
+static QueueHandle_t   s_tx_queue = NULL;
 
 void spi_cmd_emit(const char *text)
 {
@@ -45,15 +50,14 @@ void spi_cmd_emit(const char *text)
         return;
     }
 
-    /* The host reads this on the next transaction it clocks; a reply produced
-     * while one is already staged replaces it. The lock serialises writers
-     * against each other and against the post-transaction clear -- it does not
-     * fence the DMA engine, so a reply emitted mid-transaction can still be read
-     * torn. Acceptable for a status line; do not carry data that must be exact. */
-    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
-    memset(s_tx_buf, 0, SPI_CMD_BUF_LEN);
-    strncpy((char *)s_tx_buf, text, SPI_CMD_BUF_LEN - 1);
-    xSemaphoreGive(s_tx_lock);
+    /* One queued frame per line; the host drains them one transaction at a
+     * time and an all-zero frame means the queue is empty. Only spi_cmd_task
+     * touches the DMA buffer, so a line can no longer be read torn. */
+    uint8_t frame[SPI_CMD_BUF_LEN] = {0};
+    strncpy((char *)frame, text, SPI_CMD_BUF_LEN - 1);
+    if (xQueueSend(s_tx_queue, frame, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "tx queue full, dropped: %s", text);
+    }
 }
 
 bool spi_cmd_ready(void)
@@ -72,11 +76,15 @@ static void spi_cmd_task(void *arg)
 
         memset(s_rx_buf, 0, SPI_CMD_BUF_LEN);
 
-        xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+        /* Stage the next queued reply line, or an all-zero frame that tells
+         * the host there is nothing to read. */
+        if (xQueueReceive(s_tx_queue, s_tx_buf, 0) != pdTRUE) {
+            memset(s_tx_buf, 0, SPI_CMD_BUF_LEN);
+        }
+
         t.length    = SPI_CMD_BUF_LEN * 8;
         t.tx_buffer = s_tx_buf;
         t.rx_buffer = s_rx_buf;
-        xSemaphoreGive(s_tx_lock);
 
         /* Blocks until the host clocks a transaction. */
         esp_err_t err = spi_slave_transmit(SPI_CMD_HOST, &t, portMAX_DELAY);
@@ -94,12 +102,8 @@ static void spi_cmd_task(void *arg)
             received = SPI_CMD_BUF_LEN;
         }
 
-        /* The reply we just handed over has been read; clear it so a stale line
-         * is not returned again on the next transaction. */
-        xSemaphoreTake(s_tx_lock, portMAX_DELAY);
-        memset(s_tx_buf, 0, SPI_CMD_BUF_LEN);
-        xSemaphoreGive(s_tx_lock);
-
+        /* Every reply line a command produces is queued inside this call, so
+         * they are all staged before the host's next poll is answered. */
         cmd_proto_feed(&s_ctx, s_rx_buf, received);
     }
 }
@@ -108,9 +112,9 @@ esp_err_t spi_cmd_init(void)
 {
     esp_err_t err;
 
-    s_tx_lock = xSemaphoreCreateMutex();
-    if (s_tx_lock == NULL) {
-        ESP_LOGE(TAG, "failed to create tx mutex");
+    s_tx_queue = xQueueCreate(SPI_CMD_TX_QUEUE_LEN, SPI_CMD_BUF_LEN);
+    if (s_tx_queue == NULL) {
+        ESP_LOGE(TAG, "failed to create tx queue");
         return ESP_ERR_NO_MEM;
     }
 
@@ -164,7 +168,7 @@ fail:
     free(s_tx_buf);
     s_rx_buf = NULL;
     s_tx_buf = NULL;
-    vSemaphoreDelete(s_tx_lock);
-    s_tx_lock = NULL;
+    vQueueDelete(s_tx_queue);
+    s_tx_queue = NULL;
     return err;
 }

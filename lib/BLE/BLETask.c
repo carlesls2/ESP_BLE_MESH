@@ -42,7 +42,9 @@
 #include "cmd_proto.h"
 #include "mesh_attr_model.h"
 #include "spi_cmd.h"
+#include "telemetry.h"
 #include "uart_cmd.h"
+#include "uart2_cmd.h"
 
 #define TAG "EXAMPLE"
 
@@ -258,7 +260,7 @@ static void gateway_bridge_emitf(const char *fmt, ...)
         return;
     }
 
-    char line[96];
+    char line[128];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
@@ -266,6 +268,7 @@ static void gateway_bridge_emitf(const char *fmt, ...)
 
     ESP_LOGI(TAG, "bridge -> %s", line);
     uart_cmd_emit(line);
+    uart2_cmd_emit(line);
     spi_cmd_emit(line);
 }
 
@@ -611,8 +614,99 @@ static void attr_text_to_host(uint16_t src_addr, const char *text)
     char line[MESH_ATTR_MSG_MAX_LEN + 16];
     snprintf(line, sizeof(line), "TEXT 0x%04x %s", src_addr, text);
     uart_cmd_emit(line);
+    uart2_cmd_emit(line);
     spi_cmd_emit(line);
 }
+
+/* One TELEM line per answering node. Unavailable readings print as "-" so the
+ * host can tell "no battery fitted" from "battery flat" -- the packed message
+ * carries validity flags precisely so that distinction survives. */
+static void attr_telem_to_host(uint16_t src_addr, const mesh_telem_t *t)
+{
+    char batt[20];
+    char rssi[8];
+
+    if (t->flags & MESH_TELEM_FLAG_BATT_VALID) {
+        snprintf(batt, sizeof(batt), "%umV/%u%%", (unsigned)t->batt_mv,
+                 (unsigned)t->batt_pct);
+    } else {
+        snprintf(batt, sizeof(batt), "-");
+    }
+
+    if (t->flags & MESH_TELEM_FLAG_RSSI_VALID) {
+        snprintf(rssi, sizeof(rssi), "%d", (int)t->rssi);
+    } else {
+        snprintf(rssi, sizeof(rssi), "-");
+    }
+
+    gateway_bridge_emitf("TELEM 0x%04x up=%u heap=%u min=%u batt=%s rssi=%s rst=%s role=%s",
+                         src_addr, (unsigned)t->uptime_s, (unsigned)t->free_heap,
+                         (unsigned)t->min_free_heap, batt, rssi,
+                         telemetry_reset_reason_str(t->reset_reason),
+                         (t->flags & MESH_TELEM_FLAG_GATEWAY) ? "GATEWAY" : "NODE");
+}
+
+/* NODES: who has this gateway provisioned?
+ *
+ * Read straight from the stack table, which CONFIG_BLE_MESH_SETTINGS persists,
+ * so the answer survives a reboot of the gateway and of whatever host is
+ * asking. Until now the only way a host learned an address was by catching the
+ * one-shot JOINED/READY line as it happened.
+ *
+ * Answers go to the issuing transport via `emit`, not to the bridge: an
+ * enumeration belongs to whoever asked for it, and the bridge would repeat the
+ * whole list onto every other link. */
+static esp_err_t gateway_list_nodes(cmd_proto_reply_fn emit)
+{
+    if (device_mode_get() != DEVICE_MODE_GATEWAY) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const esp_ble_mesh_node_t **table = esp_ble_mesh_provisioner_get_node_table_entry();
+    if (table == NULL || emit == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char     line[96];
+    unsigned found = 0;
+
+    /* The table is sparse -- removing a node leaves a NULL hole -- so walk the
+     * whole capacity and skip gaps. Stopping at get_prov_node_count() would
+     * miss every node sitting past a hole. */
+    for (int i = 0; i < CONFIG_BLE_MESH_MAX_PROV_NODES; i++) {
+        const esp_ble_mesh_node_t *node = table[i];
+        if (node == NULL || node->unicast_addr == PROV_OWN_ADDR) {
+            continue;
+        }
+
+        /* First 8 of the 16 UUID bytes: enough to tell boards apart, and it
+         * keeps the line inside the SPI transport's 63-character frame. */
+        char uuid[17];
+        for (int b = 0; b < 8; b++) {
+            snprintf(uuid + (b * 2), 3, "%02x", node->dev_uuid[b]);
+        }
+
+        snprintf(line, sizeof(line), "NODE idx=%u unicast=0x%04x elems=%u uuid=%s",
+                 found, node->unicast_addr, node->element_num, uuid);
+        emit(line);
+        found++;
+    }
+
+    /* A definite terminator, so a host knows the list ended rather than waiting
+     * out a timeout. */
+    snprintf(line, sizeof(line), "NODES count=%u", found);
+    emit(line);
+    return ESP_OK;
+}
+
+/* Bundled so the five pointers cannot be transposed at the call site. */
+static const cmd_mesh_ops_t s_mesh_ops = {
+    .get   = mesh_attr_get,
+    .set   = mesh_attr_set,
+    .send  = mesh_attr_send_text,
+    .telem = mesh_telem_get,
+    .nodes = gateway_list_nodes,
+};
 
 /* Fills in the boilerplate for a Config Client request aimed at `unicast`.
  * Config messages are secured with the node's device key, not an app key, so
@@ -751,10 +845,10 @@ static esp_err_t ble_mesh_init(void)
         return err;
     }
     mesh_attr_model_register_cbs(attr_status_to_host, attr_set_status_to_host,
-                                 attr_text_to_host);
-    /* Lets the ASK and SEND verbs on the host channel reach the mesh without
-     * lib/cmd having to depend on lib/BLE. */
-    cmd_proto_register_mesh(mesh_attr_get, mesh_attr_set, mesh_attr_send_text);
+                                 attr_text_to_host, attr_telem_to_host);
+    /* Lets the ASK, SEND, TELEM and NODES verbs on the host channel reach the
+     * mesh without lib/cmd having to depend on lib/BLE. */
+    cmd_proto_register_mesh(&s_mesh_ops);
     dev_identity_register_change_cb(identity_changed);
 
     ESP_LOGI(TAG, "BLE Mesh stack initialized");

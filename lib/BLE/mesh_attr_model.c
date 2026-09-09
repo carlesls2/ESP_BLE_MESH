@@ -16,6 +16,7 @@
 
 #include "dev_identity.h"
 #include "device_mode.h"
+#include "telemetry.h"
 
 #define TAG "ATTR_MDL"
 
@@ -26,6 +27,8 @@
 #define OP_ATTR_SET        ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_SET,        CID_ESP)
 #define OP_ATTR_SET_STATUS ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_SET_STATUS, CID_ESP)
 #define OP_ATTR_MSG        ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_MSG,        CID_ESP)
+#define OP_TELEM_GET       ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_TELEM_GET,    CID_ESP)
+#define OP_TELEM_STATUS    ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_TELEM_STATUS, CID_ESP)
 
 /* Longest id list a GET may carry. Past this, asking for everything (count 0)
  * is cheaper anyway. */
@@ -44,7 +47,15 @@
 /* Enough for the worst-case TLV reply holding every attribute. */
 #define ATTR_MSG_BUF_LEN DEV_ATTR_MAX_TLV_LEN
 
+/* Both query kinds ride the same reply queue: they share the stagger timing
+ * and the need to transmit off the stack task. */
+typedef enum {
+    REPLY_KIND_ATTRS = 0,
+    REPLY_KIND_TELEM = 1,
+} reply_kind_t;
+
 typedef struct {
+    reply_kind_t  kind;
     uint16_t      dst;
     uint16_t      net_idx;
     uint16_t      app_idx;
@@ -57,18 +68,21 @@ static esp_ble_mesh_model_op_t s_server_ops[] = {
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_GET, 1),
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_SET, 3),
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_MSG, 1),
+    ESP_BLE_MESH_MODEL_OP(OP_TELEM_GET, 1),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
 static esp_ble_mesh_model_op_t s_client_ops[] = {
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_STATUS, 2),
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_SET_STATUS, 1),
+    ESP_BLE_MESH_MODEL_OP(OP_TELEM_STATUS, sizeof(mesh_telem_t)),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
 static const esp_ble_mesh_client_op_pair_t s_client_op_pair[] = {
     { OP_ATTR_GET, OP_ATTR_STATUS },
     { OP_ATTR_SET, OP_ATTR_SET_STATUS },
+    { OP_TELEM_GET, OP_TELEM_STATUS },
 };
 
 static esp_ble_mesh_client_t s_attr_client = {
@@ -90,14 +104,17 @@ static QueueHandle_t             s_reply_q = NULL;
 static mesh_attr_status_cb_t     s_status_cb = NULL;
 static mesh_attr_set_status_cb_t s_set_status_cb = NULL;
 static mesh_attr_text_cb_t       s_text_cb = NULL;
+static mesh_attr_telem_cb_t      s_telem_cb = NULL;
 
 void mesh_attr_model_register_cbs(mesh_attr_status_cb_t status_cb,
                                   mesh_attr_set_status_cb_t set_status_cb,
-                                  mesh_attr_text_cb_t text_cb)
+                                  mesh_attr_text_cb_t text_cb,
+                                  mesh_attr_telem_cb_t telem_cb)
 {
     s_status_cb = status_cb;
     s_set_status_cb = set_status_cb;
     s_text_cb = text_cb;
+    s_telem_cb = telem_cb;
 }
 
 /* --- Server side: answering ---------------------------------------------- */
@@ -130,6 +147,45 @@ static void send_status(const reply_req_t *req)
     }
 }
 
+static void send_telem(const reply_req_t *req)
+{
+    telemetry_snapshot_t snap;
+    telemetry_snapshot(&snap);
+
+    mesh_telem_t body = {
+        .ver           = MESH_TELEM_VER,
+        .unicast       = snap.unicast,
+        .uptime_s      = snap.uptime_s,
+        .free_heap     = snap.free_heap,
+        .min_free_heap = snap.min_free_heap,
+        .batt_mv       = snap.batt_mv,
+        .batt_pct      = snap.batt_pct,
+        .rssi          = snap.rssi,
+        .reset_reason  = snap.reset_reason,
+        .flags         = (uint8_t)((snap.is_gateway ? MESH_TELEM_FLAG_GATEWAY    : 0) |
+                                   (snap.batt_valid ? MESH_TELEM_FLAG_BATT_VALID : 0) |
+                                   (snap.rssi_valid ? MESH_TELEM_FLAG_RSSI_VALID : 0)),
+    };
+
+    esp_ble_mesh_msg_ctx_t ctx = {
+        .net_idx  = req->net_idx,
+        .app_idx  = req->app_idx,
+        .addr     = req->dst,
+        .send_ttl = ESP_BLE_MESH_TTL_DEFAULT,
+        .send_rel = false,
+    };
+
+    esp_err_t err = esp_ble_mesh_server_model_send_msg(MODEL_SERVER, &ctx,
+                                                      OP_TELEM_STATUS,
+                                                      sizeof(body), (uint8_t *)&body);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to send telemetry to 0x%04x: %d", req->dst, err);
+    } else {
+        ESP_LOGI(TAG, "telemetry sent to 0x%04x (%u bytes)", req->dst,
+                 (unsigned)sizeof(body));
+    }
+}
+
 /* Replies leave from here rather than from the mesh callback, so a segmented
  * transmission never blocks the stack's own task and the stagger delay has
  * somewhere to sleep. */
@@ -147,7 +203,11 @@ static void reply_task(void *arg)
             ESP_LOGI(TAG, "group query: replying in %u ms", (unsigned)ms);
             vTaskDelay(pdMS_TO_TICKS(ms));
         }
-        send_status(&req);
+        if (req.kind == REPLY_KIND_TELEM) {
+            send_telem(&req);
+        } else {
+            send_status(&req);
+        }
     }
 }
 
@@ -180,6 +240,29 @@ static void handle_get(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg, uint16_t
 
     if (xQueueSend(s_reply_q, &req, 0) != pdTRUE) {
         ESP_LOGW(TAG, "reply queue full, dropping query from 0x%04x", ctx->addr);
+    }
+}
+
+static void handle_telem_get(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg, uint16_t len)
+{
+    if (len >= 1 && msg[0] != MESH_TELEM_VER) {
+        /* Answer anyway -- the requester checks the version in the reply and is
+         * better placed to decide what to do about a mismatch than we are. */
+        ESP_LOGW(TAG, "0x%04x asked for telemetry v%u, sending v%u",
+                 ctx->addr, msg[0], MESH_TELEM_VER);
+    }
+
+    reply_req_t req = {
+        .kind    = REPLY_KIND_TELEM,
+        .dst     = ctx->addr,
+        .net_idx = ctx->net_idx,
+        .app_idx = ctx->app_idx,
+        .count   = 0,
+        .stagger = !ESP_BLE_MESH_ADDR_IS_UNICAST(ctx->recv_dst),
+    };
+
+    if (xQueueSend(s_reply_q, &req, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "reply queue full, dropping telemetry query from 0x%04x", ctx->addr);
     }
 }
 
@@ -285,6 +368,37 @@ static void handle_status(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg, uint1
     }
 }
 
+static void handle_telem_status(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg,
+                                uint16_t len)
+{
+    mesh_telem_t telem;
+
+    if (len < sizeof(telem)) {
+        ESP_LOGW(TAG, "short telemetry from 0x%04x (%u bytes, wanted %u)",
+                 ctx->addr, len, (unsigned)sizeof(telem));
+        return;
+    }
+
+    /* Copied out rather than cast in place: the receive buffer carries no
+     * alignment guarantee for the 32-bit members. Both ends are little-endian
+     * and the struct is packed, so the copy is the whole decode. */
+    memcpy(&telem, msg, sizeof(telem));
+
+    if (telem.ver != MESH_TELEM_VER) {
+        ESP_LOGW(TAG, "0x%04x speaks telemetry v%u, we speak v%u -- ignoring",
+                 ctx->addr, telem.ver, MESH_TELEM_VER);
+        return;
+    }
+
+    ESP_LOGI(TAG, "telemetry from 0x%04x: up=%us heap=%u batt=%umV rssi=%d",
+             ctx->addr, (unsigned)telem.uptime_s, (unsigned)telem.free_heap,
+             (unsigned)telem.batt_mv, (int)telem.rssi);
+
+    if (s_telem_cb) {
+        s_telem_cb(ctx->addr, &telem);
+    }
+}
+
 static void model_cb(esp_ble_mesh_model_cb_event_t event,
                      esp_ble_mesh_model_cb_param_t *param)
 {
@@ -295,12 +409,21 @@ static void model_cb(esp_ble_mesh_model_cb_event_t event,
         uint8_t                *msg    = param->model_operation.msg;
         uint16_t                len    = param->model_operation.length;
 
+        /* Every received message carries the radio's own measurement. Keeping
+         * the latest here is what makes RSSI reportable at all -- nothing else
+         * in the firmware ever sees an esp_ble_mesh_msg_ctx_t. */
+        telemetry_note_rssi(ctx->recv_rssi);
+
         if (opcode == OP_ATTR_GET) {
             handle_get(ctx, msg, len);
         } else if (opcode == OP_ATTR_SET) {
             handle_set(ctx, msg, len);
         } else if (opcode == OP_ATTR_MSG) {
             handle_msg(ctx, msg, len);
+        } else if (opcode == OP_TELEM_GET) {
+            handle_telem_get(ctx, msg, len);
+        } else if (opcode == OP_TELEM_STATUS) {
+            handle_telem_status(ctx, msg, len);
         } else if (opcode == OP_ATTR_STATUS) {
             handle_status(ctx, msg, len);
         } else if (opcode == OP_ATTR_SET_STATUS) {
@@ -516,4 +639,12 @@ esp_err_t mesh_attr_send_text(uint16_t dst, const char *text)
     ESP_LOGI(TAG, "sending %u chars to 0x%04x", (unsigned)len, dst);
     /* Fire-and-forget: no status opcode pairs with MSG, so never wait. */
     return client_send(dst, OP_ATTR_MSG, (uint8_t *)text, (uint16_t)len, false);
+}
+
+esp_err_t mesh_telem_get(uint16_t dst)
+{
+    uint8_t body = MESH_TELEM_VER;
+
+    ESP_LOGI(TAG, "requesting telemetry from 0x%04x", dst);
+    return client_send(dst, OP_TELEM_GET, &body, sizeof(body), true);
 }

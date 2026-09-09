@@ -6,6 +6,13 @@
  * the board comes up can leave it unbootable.
  *
  * Default pins: MOSI 23, MISO 19, SCLK 18, CS 5.
+ *
+ * Framing: every transaction is exactly 64 bytes. The host sends a
+ * newline-terminated ASCII command zero-padded to the frame; the slave returns
+ * one queued reply line per transaction as a NUL-terminated string, truncated
+ * to 63 chars. A frame whose first byte is 0x00 carries no line -- the host
+ * polls with zero-filled frames until it sees that. Reply lines wait in a
+ * queue, so multi-line replies (HELP, ID?) and async bridge lines all arrive.
  */
 
 #ifndef _SPI_CMD_H_

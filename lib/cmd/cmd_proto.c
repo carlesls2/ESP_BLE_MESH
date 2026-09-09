@@ -93,20 +93,32 @@ static bool split_token(const char *in, char *tok, size_t tok_size, const char *
     return true;
 }
 
+/* Renders one "ID <NAME> <value>" line.
+ *
+ * A dynamic attribute whose provider declined reports "-": no battery divider
+ * fitted, nothing heard yet for RSSI, no address until provisioned. That is a
+ * normal answer, not a failure, and it must not read like corruption --
+ * "<unreadable>" stays reserved for a stored value that really is malformed. */
+static void format_attr_line(const dev_attr_desc_t *desc, char *msg, size_t msg_size)
+{
+    char value[DEV_ATTR_MAX_VALUE_LEN + 1];
+
+    if (dev_identity_get_text(desc->id, value, sizeof(value)) == ESP_OK) {
+        snprintf(msg, msg_size, "ID %s %s", desc->name, value);
+    } else if (dev_attr_is_dynamic(desc)) {
+        snprintf(msg, msg_size, "ID %s -", desc->name);
+    } else {
+        snprintf(msg, msg_size, "ID %s <unreadable>", desc->name);
+    }
+}
+
 /* Dumps every attribute in the registry, one reply line each. Iterating the
  * table means a new attribute shows up here with no edit. */
 static void report_identity(cmd_proto_ctx_t *ctx)
 {
     for (size_t i = 0; i < dev_attr_count(); i++) {
-        const dev_attr_desc_t *desc = dev_attr_at(i);
-        char value[DEV_ATTR_MAX_VALUE_LEN + 1];
         char msg[DEV_ATTR_MAX_VALUE_LEN + 32];
-
-        if (dev_identity_get_text(desc->id, value, sizeof(value)) == ESP_OK) {
-            snprintf(msg, sizeof(msg), "ID %s %s", desc->name, value);
-        } else {
-            snprintf(msg, sizeof(msg), "ID %s <unreadable>", desc->name);
-        }
+        format_attr_line(dev_attr_at(i), msg, sizeof(msg));
         reply(ctx, msg);
     }
 }
@@ -119,13 +131,8 @@ static void report_one_attr(cmd_proto_ctx_t *ctx, const char *attr_name)
         return;
     }
 
-    char value[DEV_ATTR_MAX_VALUE_LEN + 1];
     char msg[DEV_ATTR_MAX_VALUE_LEN + 32];
-    if (dev_identity_get_text(desc->id, value, sizeof(value)) == ESP_OK) {
-        snprintf(msg, sizeof(msg), "ID %s %s", desc->name, value);
-    } else {
-        snprintf(msg, sizeof(msg), "ID %s <unreadable>", desc->name);
-    }
+    format_attr_line(desc, msg, sizeof(msg));
     reply(ctx, msg);
 }
 
@@ -159,16 +166,11 @@ static void set_local_attr(cmd_proto_ctx_t *ctx, const char *args)
     }
 }
 
-static cmd_mesh_get_fn  s_mesh_get = NULL;
-static cmd_mesh_set_fn  s_mesh_set = NULL;
-static cmd_mesh_send_fn s_mesh_send = NULL;
+static const cmd_mesh_ops_t *s_mesh = NULL;
 
-void cmd_proto_register_mesh(cmd_mesh_get_fn get_fn, cmd_mesh_set_fn set_fn,
-                             cmd_mesh_send_fn send_fn)
+void cmd_proto_register_mesh(const cmd_mesh_ops_t *ops)
 {
-    s_mesh_get = get_fn;
-    s_mesh_set = set_fn;
-    s_mesh_send = send_fn;
+    s_mesh = ops;
 }
 
 /* "ALL" targets the all-nodes broadcast address; anything else is parsed as an
@@ -209,7 +211,7 @@ static void ask_remote_set(cmd_proto_ctx_t *ctx, const char *args)
     const char *rest = NULL;
     const char *value = NULL;
 
-    if (s_mesh_set == NULL) {
+    if (s_mesh == NULL || s_mesh->set == NULL) {
         reply(ctx, "ERR mesh not available");
         return;
     }
@@ -231,7 +233,7 @@ static void ask_remote_set(cmd_proto_ctx_t *ctx, const char *args)
         return;
     }
 
-    esp_err_t err = s_mesh_set(dst, desc->id, value);
+    esp_err_t err = s_mesh->set(dst, desc->id, value);
     if (err == ESP_OK) {
         char msg[64];
         snprintf(msg, sizeof(msg), "ASK SET 0x%04x %s sent", dst, desc->name);
@@ -247,7 +249,7 @@ static void ask_query(cmd_proto_ctx_t *ctx, const char *args)
     char        target[16];
     const char *rest = NULL;
 
-    if (s_mesh_get == NULL) {
+    if (s_mesh == NULL || s_mesh->get == NULL) {
         reply(ctx, "ERR mesh not available");
         return;
     }
@@ -282,7 +284,7 @@ static void ask_query(cmd_proto_ctx_t *ctx, const char *args)
         rest = next;
     }
 
-    esp_err_t err = s_mesh_get(dst, count ? ids : NULL, count);
+    esp_err_t err = s_mesh->get(dst, count ? ids : NULL, count);
     if (err == ESP_OK) {
         char msg[64];
         snprintf(msg, sizeof(msg), "ASK 0x%04x sent (%u attrs)", dst, (unsigned)count);
@@ -298,7 +300,7 @@ static void send_text(cmd_proto_ctx_t *ctx, const char *args)
     char        target[16];
     const char *text = NULL;
 
-    if (s_mesh_send == NULL) {
+    if (s_mesh == NULL || s_mesh->send == NULL) {
         reply(ctx, "ERR mesh not available");
         return;
     }
@@ -313,7 +315,7 @@ static void send_text(cmd_proto_ctx_t *ctx, const char *args)
         return;
     }
 
-    esp_err_t err = s_mesh_send(dst, text);
+    esp_err_t err = s_mesh->send(dst, text);
     if (err == ESP_OK) {
         char msg[48];
         snprintf(msg, sizeof(msg), "SEND 0x%04x %u chars sent",
@@ -322,6 +324,60 @@ static void send_text(cmd_proto_ctx_t *ctx, const char *args)
     } else if (err == ESP_ERR_INVALID_SIZE) {
         reply(ctx, "ERR text too long");
     } else {
+        mesh_err_reply(ctx, err);
+    }
+}
+
+/* TELEM <target> -- one packed vitals snapshot per node, answered
+ * asynchronously on the bridge as a TELEM line. Cheaper on the air than
+ * ASK <addr> with every attribute named; see mesh_attr_model.h. */
+static void telem_query(cmd_proto_ctx_t *ctx, const char *args)
+{
+    char        target[16];
+    const char *ignored = NULL;
+
+    if (s_mesh == NULL || s_mesh->telem == NULL) {
+        reply(ctx, "ERR mesh not available");
+        return;
+    }
+    if (!split_token(args, target, sizeof(target), &ignored)) {
+        reply(ctx, "ERR usage: TELEM <addr|ALL>");
+        return;
+    }
+
+    uint16_t dst;
+    if (!parse_target(target, &dst)) {
+        reply(ctx, "ERR bad address");
+        return;
+    }
+
+    esp_err_t err = s_mesh->telem(dst);
+    if (err == ESP_OK) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "TELEM 0x%04x sent", dst);
+        reply(ctx, msg);
+    } else {
+        mesh_err_reply(ctx, err);
+    }
+}
+
+/* NODES -- who has this gateway provisioned? Read straight out of the stack's
+ * own table, which CONFIG_BLE_MESH_SETTINGS persists, so the answer survives a
+ * reboot of both the gateway and whatever host is asking. */
+static void list_nodes(cmd_proto_ctx_t *ctx)
+{
+    if (s_mesh == NULL || s_mesh->nodes == NULL) {
+        reply(ctx, "ERR mesh not available");
+        return;
+    }
+    if (ctx->reply == NULL) {
+        /* Nowhere to write the list; refuse rather than half-answer. */
+        reply(ctx, "ERR transport has no reply channel");
+        return;
+    }
+
+    esp_err_t err = s_mesh->nodes(ctx->reply);
+    if (err != ESP_OK) {
         mesh_err_reply(ctx, err);
     }
 }
@@ -343,6 +399,8 @@ static const cmd_help_row_t s_help_rows[] = {
     { "ASK",  "ASK <addr|ALL> [attr ...]",        "query attributes of remote nodes (gateway)" },
     { "ASK",  "ASK SET <addr> <attr> <value>",    "write an attribute on a remote node (gateway)" },
     { "SEND", "SEND <addr|ALL> <text>",           "send text to remote nodes (gateway)" },
+    { "TELEM","TELEM <addr|ALL>",                 "live vitals: uptime, heap, battery, RSSI (gateway)" },
+    { "NODES","NODES",                            "list nodes this gateway has provisioned" },
     { "HELP", "HELP [command] | <command> --help", "show this menu" },
 };
 
@@ -447,6 +505,10 @@ static void handle_line(cmd_proto_ctx_t *ctx, char *line)
         ask_query(ctx, rest);
     } else if (line_starts_with(line, "SEND", &rest)) {
         send_text(ctx, rest);
+    } else if (line_starts_with(line, "TELEM", &rest)) {
+        telem_query(ctx, rest);
+    } else if (line_is(line, "NODES") || line_is(line, "NODES?")) {
+        list_nodes(ctx);
     } else {
         reply(ctx, "ERR unknown command (try HELP)");
     }

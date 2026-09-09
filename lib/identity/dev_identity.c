@@ -16,7 +16,9 @@
 #define NVS_NAMESPACE "devid"
 
 /* One cache slot per registry row, indexed the same way. Raw wire form, so the
- * mesh path can memcpy straight out of it. */
+ * mesh path can memcpy straight out of it. Dynamic rows own a slot too -- it
+ * simply stays empty, which keeps every index in this file identical to the
+ * registry's. */
 typedef struct {
     uint8_t value[DEV_ATTR_MAX_VALUE_LEN];
     size_t  len;
@@ -65,6 +67,12 @@ static void slot_load(size_t index)
     const dev_attr_desc_t *desc = dev_attr_at(index);
     attr_slot_t *slot = &s_slots[index];
 
+    /* Dynamic rows have no nvs_key and no default -- nothing to load. */
+    if (dev_attr_is_dynamic(desc)) {
+        slot->len = 0;
+        return;
+    }
+
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_OK) {
@@ -88,6 +96,27 @@ static void slot_load(size_t index)
      * NVS directly, and so first-boot state matches steady state. */
     slot_persist(desc, slot->value, slot->len);
     ESP_LOGI(TAG, "%s seeded with default", desc->name);
+}
+
+/* The single read funnel: a dynamic row is computed by its provider, a stored
+ * one is copied out of the RAM cache. Providers are called with the lock
+ * released -- they touch no state this module owns, and holding a mutex across
+ * an ADC read would put the mesh receive path behind it. */
+static bool fetch_raw(const dev_attr_desc_t *desc, int idx, uint8_t *out,
+                      size_t out_size, size_t *out_len)
+{
+    if (dev_attr_is_dynamic(desc)) {
+        return dev_attr_provide(desc, out, out_size, out_len);
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool ok = (s_slots[idx].len > 0) && (s_slots[idx].len <= out_size);
+    if (ok) {
+        memcpy(out, s_slots[idx].value, s_slots[idx].len);
+        *out_len = s_slots[idx].len;
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
 }
 
 void dev_identity_register_change_cb(dev_identity_change_cb_t cb)
@@ -136,11 +165,17 @@ esp_err_t dev_identity_init(void)
         }
     }
 
+    /* Dynamic rows appear here only if telemetry_init() already registered
+     * their providers; if it has not, they are simply quiet at boot and still
+     * answer a later ID?. */
     for (size_t i = 0; i < dev_attr_count(); i++) {
         const dev_attr_desc_t *desc = dev_attr_at(i);
-        char text[DEV_ATTR_MAX_VALUE_LEN + 1];
-        if (dev_attr_value_to_text(desc, s_slots[i].value, s_slots[i].len,
-                                   text, sizeof(text))) {
+        uint8_t raw[DEV_ATTR_MAX_VALUE_LEN];
+        size_t  raw_len = 0;
+        char    text[DEV_ATTR_MAX_VALUE_LEN + 1];
+
+        if (fetch_raw(desc, (int)i, raw, sizeof(raw), &raw_len) &&
+            dev_attr_value_to_text(desc, raw, raw_len, text, sizeof(text))) {
             ESP_LOGI(TAG, "%-10s = %s", desc->name, text);
         }
     }
@@ -159,16 +194,13 @@ esp_err_t dev_identity_get_raw(dev_attr_id_t id, uint8_t *out, size_t out_size,
         return ESP_ERR_NOT_FOUND;
     }
 
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    esp_err_t err = ESP_OK;
-    if (s_slots[idx].len > out_size) {
-        err = ESP_ERR_INVALID_SIZE;
-    } else {
-        memcpy(out, s_slots[idx].value, s_slots[idx].len);
-        *out_len = s_slots[idx].len;
+    const dev_attr_desc_t *desc = dev_attr_at((size_t)idx);
+    if (!fetch_raw(desc, idx, out, out_size, out_len)) {
+        /* A dynamic row whose provider declined is unavailable, not malformed:
+         * no battery divider fitted, or no unicast address assigned yet. */
+        return dev_attr_is_dynamic(desc) ? ESP_ERR_NOT_FOUND : ESP_ERR_INVALID_SIZE;
     }
-    xSemaphoreGive(s_lock);
-    return err;
+    return ESP_OK;
 }
 
 esp_err_t dev_identity_get_text(dev_attr_id_t id, char *out, size_t out_size)
@@ -211,10 +243,17 @@ esp_err_t dev_identity_set_raw(dev_attr_id_t id, const uint8_t *value,
     if (s_slots == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    /* Dynamic rows are computed; there is no store behind them to write. The
+     * flag check below would refuse them anyway, but saying so plainly here
+     * keeps the reason out of a confusing "not writable" log line. */
+    if (dev_attr_is_dynamic(desc)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if (value == NULL || value_len == 0 || value_len > desc->max_len) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (desc->type == DEV_ATTR_TYPE_U16 && value_len != 2) {
+    size_t width = dev_attr_type_size(desc->type);
+    if (width > 0 && value_len != width) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -279,12 +318,17 @@ size_t dev_identity_encode_tlv(const dev_attr_id_t *ids, size_t id_count,
             continue;
         }
 
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        bool ok = dev_attr_tlv_append(out, out_size, &offset, id,
-                                      s_slots[idx].value, s_slots[idx].len);
-        xSemaphoreGive(s_lock);
+        const dev_attr_desc_t *desc = dev_attr_at((size_t)idx);
+        uint8_t raw[DEV_ATTR_MAX_VALUE_LEN];
+        size_t  raw_len = 0;
 
-        if (!ok) {
+        /* An unavailable dynamic value is omitted rather than sent as zero, so
+         * the host can tell "no battery fitted" from "battery flat". */
+        if (!fetch_raw(desc, idx, raw, sizeof(raw), &raw_len)) {
+            continue;
+        }
+
+        if (!dev_attr_tlv_append(out, out_size, &offset, id, raw, raw_len)) {
             /* Out of room: return what fits rather than dropping the reply.
              * The requester can narrow the query and ask again. */
             ESP_LOGW(TAG, "TLV buffer full, truncating after %u bytes", (unsigned)offset);
