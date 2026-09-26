@@ -11,9 +11,9 @@ Two programs:
 | `meshctl.py` | the link itself — one-shot commands, an interactive REPL, and a `MeshLink` class other scripts import |
 | `mesh_survey.py` | asks every node in the mesh how it is doing, as a table, JSON, or CSV |
 
-## Quick start (USB — no wiring needed)
+## Quick start
 
-Plug the gateway board into the Pi and:
+Plug the gateway board into the Pi over USB and:
 
 ```sh
 sudo apt install python3-serial
@@ -34,9 +34,72 @@ omits it.
 
 `battery` shows `-` until a divider is configured — see **Battery** below.
 
+Wired to the GPIO header instead — see **Links** — add `--uart` for
+`/dev/ttyAMA0` or `--spi` for `/dev/spidev0.0`:
+
+```sh
+sudo apt install python3-serial python3-spidev
+python3 mesh_survey.py --uart
+```
+
 ## Links
 
-### USB (recommended)
+### Power
+
+The board can run off the Pi's 5 V rail, which is what you want for a permanent
+install — no USB cable, and the gateway comes up when the Pi does.
+
+| Pi header pin | Pi name | Dir | ESP32 pin                             |
+|---------------|---------|-----|---------------------------------------|
+| 2             | 5V      | →   | `5V` (bottom pin of the left-hand row) |
+| 6             | GND     | —   | any `GND`                             |
+
+**One supply at a time.** On the DevKitC V4 the `5V` header pin is the same net
+as USB `VBUS` — there is no isolating diode. Feed the board from the Pi *or*
+from USB, never both.
+
+**Flashing still needs USB.** There is no OTA in this firmware. The routine is:
+pull the 5 V jumper, plug USB, `pio run -t upload`, unplug USB, reconnect 5 V.
+The UART2 and SPI jumpers can stay connected throughout — neither bus is driven
+while flashing.
+
+**Do not wire Pi 3V3 (pin 1) to the DevKit `3V3` pin.** That backfeeds the
+on-board regulator's output.
+
+The ESP32 idles around 80 mA and peaks at 250–500 mA on a BLE transmit —
+comfortable for a Pi 5 on the 27 W supply. On an undersized PSU it is the *Pi*
+that browns out first, not the ESP32. A sagging feed is visible rather than
+mysterious: the brownout detector runs at its most sensitive setting and `RESET`
+reports `BROWNOUT`, so it lands in the `reset` column of `mesh_survey.py`.
+
+### Everything wired at once
+
+Power, commands over UART2, and SPI as a second channel — nine wires:
+
+| Pi header pin | Pi name       | Dir | ESP32 pin    |
+|---------------|---------------|-----|--------------|
+| 2             | 5V            | →   | `5V`         |
+| 6             | GND           | —   | GND          |
+| 8             | GPIO14 / TXD  | →   | GPIO16 (RX2) |
+| 10            | GPIO15 / RXD  | ←   | GPIO17 (TX2) |
+| 19            | GPIO10 / MOSI | →   | GPIO23       |
+| 21            | GPIO9 / MISO  | ←   | GPIO19       |
+| 23            | GPIO11 / SCLK | →   | GPIO18       |
+| 24            | GPIO8 / CE0   | →   | GPIO5 (CS)   |
+| 20            | GND           | —   | GND          |
+
+Pi header pin 1 is the corner nearest the USB-C socket, and the odd-numbered
+pins are the row closest to the board edge.
+
+On the ESP32 side, hold the DevKitC with the USB socket toward you: **every
+signal pin is on the right-hand row.** `GPIO23` is second from the top, and
+`GND, GPIO19, GPIO18, GPIO5, GPIO17, GPIO16` are a run of six consecutive pins
+(positions 7–12). Only `5V` is on the other side, at the bottom of the left-hand
+row.
+
+The sections below cover each bus on its own, and the setup each one needs.
+
+### USB (no wiring, and the flashing path)
 
 The board's own USB-serial bridge appears on the Pi as `/dev/ttyUSB0` (CP210x)
 or `/dev/ttyACM0`. `meshctl.py` finds it automatically, preferring the stable
@@ -84,9 +147,9 @@ sudo usermod -aG dialout $USER   # then log out and back in
 `sudo raspi-config` → Interface Options → SPI → enable. After reboot
 `/dev/spidev0.0` exists. `sudo apt install python3-spidev`.
 
-All three buses can be wired at once; they are independent channels. Both sides
-are 3.3 V — wire directly, **no level shifter**, but a **common GND is
-mandatory**.
+The three buses are independent channels — wire as many as you want, as in
+**Everything wired at once** above. Both sides are 3.3 V, so wire directly,
+**no level shifter**, but a **common GND is mandatory**.
 
 ## Usage
 
