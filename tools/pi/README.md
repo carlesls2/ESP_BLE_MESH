@@ -54,9 +54,17 @@ install — no USB cable, and the gateway comes up when the Pi does.
 | 2             | 5V      | →   | `5V` (bottom pin of the left-hand row) |
 | 6             | GND     | —   | any `GND`                             |
 
-**One supply at a time.** On the DevKitC V4 the `5V` header pin is the same net
-as USB `VBUS` — there is no isolating diode. Feed the board from the Pi *or*
-from USB, never both.
+**One supply at a time.** Espressif's DevKitC guide allows exactly one power
+source: USB, the `5V` pin, or the `3V3` pin. A genuine V4 has a Schottky diode
+(D3, BAT760) from USB `VBUS` to the `5V` pin, so the Pi's 5 V cannot flow back
+into a PC's USB port — but the reverse path is open: with USB plugged in and
+the Pi's supply off, the PC tries to power the Pi through the 5 V wire. Many
+clones leave the diode out and tie the two supplies straight together. Feed the
+board from the Pi *or* from USB.
+
+To check a board, power it from the Pi only, plug a USB cable into it with the
+far end loose, and measure between the two outer pins of the USB-A plug: about
+0 V means the diode is there, about 5 V means it is not.
 
 **Flashing still needs USB.** There is no OTA in this firmware. The routine is:
 pull the 5 V jumper, plug USB, `pio run -t upload`, unplug USB, reconnect 5 V.
