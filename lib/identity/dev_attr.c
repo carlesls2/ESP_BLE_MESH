@@ -12,7 +12,7 @@
  * Override from platformio.ini with -DAPP_FW_VERSION=\"x.y.z\" if you wire this
  * to git describe later. */
 #ifndef APP_FW_VERSION
-#define APP_FW_VERSION "0.4.0"
+#define APP_FW_VERSION "0.5.0"
 #endif
 
 #ifndef APP_HW_VERSION

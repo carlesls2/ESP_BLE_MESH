@@ -152,8 +152,14 @@ sudo usermod -aG dialout $USER   # then log out and back in
 | 24            | GPIO8 / CE0    | →   | GPIO5     |
 | 20            | GND            | —   | GND       |
 
-`sudo raspi-config` → Interface Options → SPI → enable. After reboot
+`sudo raspi-config` → Interface Options → SPI → enable, or add
+`dtparam=spi=on` to `/boot/firmware/config.txt`. After reboot
 `/dev/spidev0.0` exists. `sudo apt install python3-spidev`.
+
+`meshctl.py` clocks at 1 MHz (`--speed` to change). Measured on a Pi 5 with
+jumper wires and firmware 0.5.0: clean from 125 kHz to 8 MHz, including 150
+back-to-back `ID?` at 8 MHz without an error. Firmware before 0.5.0 lost frames
+at 8 MHz. The default leaves plenty of margin for longer wiring.
 
 The three buses are independent channels — wire as many as you want, as in
 **Everything wired at once** above. Both sides are 3.3 V, so wire directly,
@@ -216,6 +222,24 @@ HELP [command]                   show the menu
 Errors start with `ERR `. Unsolicited lines arrive at any time once the device
 is a gateway (or receives a SEND): `JOINED`, `READY`, `MSG`, `ATTR`, `ATTRSET`,
 `TEXT`, `TELEM`.
+
+### SPI framing
+
+Every transaction is 64 bytes in both directions. The Pi sends a command as
+newline-terminated ASCII padded with zeros, then polls with all-zero frames;
+each poll returns one queued reply frame:
+
+| First byte | Meaning |
+|------------|---------|
+| `0x00` | nothing queued |
+| printable | a whole line of up to 63 chars, NUL-terminated |
+| `0x01` | up to 62 chars of a longer line; more fragments follow |
+| `0x02` | the last fragment of a longer line |
+
+A reply starts a couple of frames after its command, so poll until the queue
+has been quiet for a while (`meshctl.py` waits 0.3 s) rather than stopping at
+the first empty frame. Fragments need firmware 0.5.0 — see **SPI on firmware
+older than 0.5.0** below.
 
 ### Attributes
 
@@ -306,6 +330,26 @@ E (22863) ATTR_MDL: send failed for opcode 0xd402e5, err -22
 normally. This affects `SEND` and `ASK` too, so it is not specific to `TELEM`.
 `mesh_survey.py` does not work around it automatically — if every node is
 silent on a freshly booted gateway, toggle the role and retry.
+
+### SPI on firmware older than 0.5.0
+
+`ID?` reports `FW_VER`. Before 0.5.0 the SPI link has two faults:
+
+- **Lines are cut at 63 chars.** Every `TELEM` line is longer than that, so
+  over SPI it loses `rst` and `role` (and `rssi` once a battery is reported).
+  Most `HELP` lines and long `ATTR`/`TEXT` lines are cut too.
+- **Polling while a command runs desynchronises the slave.** The old firmware
+  runs each command inside its SPI task and arms no transaction until it is
+  done — about 60 ms for `ID?`, since every reply line is also logged to the
+  console, and longer while UART2 is busy too. A frame clocked in that window
+  arrives torn; its newline is lost, later commands pile up, and the link stays
+  dead until the parser answers `ERR command too long`.
+
+`meshctl.py` works around the second one: it waits 150 ms after each command
+before polling, and sends a lone newline when it opens the port so a half-received
+line cannot prefix the first command. That holds from 125 kHz to 4 MHz on its
+own, but not while UART2 is running commands at the same time. Firmware 0.5.0
+fixes both.
 
 ### Opening the port must not reset the board
 

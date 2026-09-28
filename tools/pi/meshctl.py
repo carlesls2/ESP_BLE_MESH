@@ -7,7 +7,9 @@ Talks the same line protocol on three links:
         the line; it is filtered out here (see LOG_LINE_RE).
   UART: ESP32 UART2 (TX GPIO17 -> Pi RXD, RX GPIO16 <- Pi TXD), 115200 8N1.
   SPI:  ESP32 SPI slave on VSPI (MOSI 23, MISO 19, SCLK 18, CS 5), mode 0,
-        fixed 64-byte frames; a reply frame starting with 0x00 is empty.
+        fixed 64-byte frames; a reply frame starting with 0x00 is empty. A
+        line too long for one frame arrives as fragments: 0x01 + text while
+        more follows, 0x02 + text for the last piece (firmware 0.5.0+).
 
 One-shot:     python3 meshctl.py --usb MODE?
               python3 meshctl.py --spi SEND ALL hello
@@ -34,6 +36,15 @@ import threading
 import time
 
 SPI_FRAME_LEN = 64
+SPI_FRAG_MORE = 0x01   # fragment of a longer line, more follow
+SPI_FRAG_END = 0x02    # last fragment of a longer line
+
+# Firmware before 0.5.0 runs a command inside its SPI task and arms no frame
+# until it is done -- tens of ms, since every reply line is also logged to the
+# console at 115200 baud. A frame clocked into that window arrives torn and
+# desynchronises the slave, so the host waits this long before polling.
+SPI_SETTLE_S = 0.15
+
 ASYNC_PREFIXES = ("JOINED", "READY", "MSG", "ATTR", "ATTRSET", "TEXT",
                   "NODE", "NODES", "TELEM")
 
@@ -159,9 +170,14 @@ class UartTransport(_SerialTransport):
         super().__init__(port, baud)
 
 
+# _xfer's answer for a fragment: data arrived, but the line is not complete.
+_PARTIAL = object()
+
+
 class SpiTransport:
-    # Conservative clock: the ESP32 SPI slave routes these pins through the
-    # GPIO matrix, which limits usable speed well below the Pi's maximum.
+    # Conservative clock. Firmware 0.5.0 soaked clean at 8 MHz over jumper
+    # wires; 1 MHz leaves margin for longer or noisier wiring and costs little
+    # with 64-byte frames.
     def __init__(self, dev="0.0", speed=1_000_000):
         import spidev
 
@@ -171,16 +187,43 @@ class SpiTransport:
         self.spi.mode = 0
         self.spi.max_speed_hz = speed
         self.name = "/dev/spidev%d.%s" % (int(bus), cs or 0)
+        self._partial = b""
+        self._resync()
+
+    def _resync(self):
+        """Start the session on a clean line.
+
+        A torn frame or a session killed mid-command can leave half a line in
+        the firmware's parser, which then prefixes the next command. A lone
+        newline ends it; the reply that provokes, and any stale queued lines,
+        are drained so they cannot pass for the answer to the first command.
+        """
+        self._xfer(b"\n")
+        time.sleep(SPI_SETTLE_S)
+        for _ in range(64):
+            if self._xfer() is None:
+                break
 
     def _xfer(self, payload=b""):
-        """Clock one fixed-size frame; return the received line or None."""
+        """Clock one fixed-size frame. Returns the received line, _PARTIAL for
+        a fragment of a longer one, or None for an empty frame."""
         frame = list(payload.ljust(SPI_FRAME_LEN, b"\x00")[:SPI_FRAME_LEN])
         rx = bytes(self.spi.xfer2(frame))
         # Give the slave time to re-queue its next transaction; clocking into
         # that gap loses bytes on both directions.
         time.sleep(0.002)
-        if rx[0] == 0:
+        head = rx[0]
+        if head == 0:
             return None
+        if head == SPI_FRAG_MORE:
+            self._partial += rx[1:].split(b"\x00", 1)[0]
+            if len(self._partial) > 1024:  # the END never came; start over
+                self._partial = b""
+            return _PARTIAL
+        if head == SPI_FRAG_END:
+            line = self._partial + rx[1:].split(b"\x00", 1)[0]
+            self._partial = b""
+            return _clean_line(line)
         return _clean_line(rx.split(b"\x00", 1)[0])
 
     def send(self, cmd):
@@ -190,7 +233,9 @@ class SpiTransport:
                              % (SPI_FRAME_LEN - 2))
         # A queued line (e.g. async bridge output) rides out on this same
         # transaction; don't lose it.
-        return self._xfer(payload)
+        ride_along = self._xfer(payload)
+        time.sleep(SPI_SETTLE_S)
+        return ride_along if isinstance(ride_along, str) else None
 
     def read_lines(self, max_polls=1):
         """Poll for queued lines with empty frames."""
@@ -199,25 +244,37 @@ class SpiTransport:
             line = self._xfer()
             if line is None:
                 break
-            lines.append(line)
+            if line is not _PARTIAL:
+                lines.append(line)
         return lines
 
     def command(self, cmd):
-        """Send one command, poll until the reply queue stays empty."""
+        """Send one command, poll until the reply queue has been quiet for
+        QUIET_WINDOW_S -- the same rule the serial links use.
+
+        Counting empty frames is not enough: the firmware runs a command before
+        it stages the next frame, so a long reply can leave several polls empty
+        before its first line. Stopping after three empties gave up on ID?
+        while it was still being produced, and its lines then surfaced as the
+        reply to the next command.
+        """
         replies = []
         ride_along = self.send(cmd)
         if ride_along is not None:
             replies.append(ride_along)
-        empties = 0
         deadline = time.monotonic() + REPLY_CAP_S
-        while empties < 3 and time.monotonic() < deadline:
+        last_rx = time.monotonic()
+        while time.monotonic() < deadline:
             line = self._xfer()
-            if line is None:
-                empties += 1
-                time.sleep(0.02)
-            else:
+            if line is _PARTIAL:
+                last_rx = time.monotonic()
+            elif line is not None:
                 replies.append(line)
-                empties = 0
+                last_rx = time.monotonic()
+            elif time.monotonic() - last_rx > QUIET_WINDOW_S:
+                break
+            else:
+                time.sleep(0.02)
         return replies
 
     def close(self):
@@ -626,6 +683,15 @@ def run_repl(tr, is_spi):
     return 0
 
 
+def _looks_like_port(flag, value):
+    """True if `value` names a port for `flag` rather than starting a command."""
+    if flag == "spi":
+        return re.fullmatch(r"\d+(\.\d+)?", value) is not None
+    # a device path, a pyserial URL (socket://, rfc2217://) or a Windows COMn
+    return (value.startswith("/") or "://" in value
+            or re.fullmatch(r"(?i)com\d+", value) is not None)
+
+
 def open_transport(args):
     if args.spi is not None:
         return SpiTransport(args.spi, args.speed)
@@ -653,6 +719,16 @@ def main():
     ap.add_argument("command", nargs=argparse.REMAINDER,
                     help="command to send (omit for interactive mode)")
     args = ap.parse_args()
+
+    # The link flags take an optional PORT, so when none is given argparse
+    # hands them the first word of the command instead: "--uart MODE?" parsed
+    # as port "MODE?" and no command at all. Give that word back to the command
+    # unless it really is a port.
+    for flag, default in (("usb", ""), ("uart", ""), ("spi", "0.0")):
+        value = getattr(args, flag)
+        if value and not _looks_like_port(flag, value):
+            args.command.insert(0, value)
+            setattr(args, flag, default)
 
     # Default to USB when no link is named: it needs no wiring or config.txt
     # edits, which makes it the right first thing to try.
