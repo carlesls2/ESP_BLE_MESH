@@ -3,6 +3,7 @@
 #include "cmd_proto.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -382,6 +383,305 @@ static void list_nodes(cmd_proto_ctx_t *ctx)
     }
 }
 
+/* NEIGHBORS -- this board's own table, answered on the spot. Works in NODE mode
+ * too: every board keeps a table, gateway or not. */
+static void neighbors_local(cmd_proto_ctx_t *ctx)
+{
+    if (s_mesh == NULL || s_mesh->neigh_local == NULL) {
+        reply(ctx, "ERR mesh not available");
+        return;
+    }
+    if (ctx->reply == NULL) {
+        reply(ctx, "ERR transport has no reply channel");
+        return;
+    }
+
+    esp_err_t err = s_mesh->neigh_local(ctx->reply);
+    if (err != ESP_OK) {
+        mesh_err_reply(ctx, err);
+    }
+}
+
+/* NEIGHBORS <addr|ALL> -- a remote node's table, via the gateway. Results
+ * arrive asynchronously on the bridge. */
+static void neighbors_query(cmd_proto_ctx_t *ctx, const char *args)
+{
+    char        target[16];
+    const char *ignored = NULL;
+
+    if (s_mesh == NULL || s_mesh->neigh_query == NULL) {
+        reply(ctx, "ERR mesh not available");
+        return;
+    }
+    if (!split_token(args, target, sizeof(target), &ignored)) {
+        reply(ctx, "ERR usage: NEIGHBORS [addr|ALL]");
+        return;
+    }
+
+    uint16_t dst;
+    if (!parse_target(target, &dst) ||
+        (dst != 0xFFFF && (dst & 0x8000) != 0)) {
+        reply(ctx, "ERR bad address (unicast or ALL)");
+        return;
+    }
+
+    esp_err_t err = s_mesh->neigh_query(dst);
+    if (err == ESP_OK) {
+        char msg[48];
+        if (dst == 0xFFFF) {
+            snprintf(msg, sizeof(msg), "NEIGHBORS ALL started");
+        } else {
+            snprintf(msg, sizeof(msg), "NEIGHBORS 0x%04x sent", dst);
+        }
+        reply(ctx, msg);
+    } else if (err == ESP_ERR_INVALID_ARG) {
+        /* The gateway's own address: nothing to ask over the air. */
+        neighbors_local(ctx);
+    } else if (err == ESP_ERR_NOT_FINISHED) {
+        reply(ctx, "ERR a NEIGHBORS ALL sweep is already running");
+    } else {
+        mesh_err_reply(ctx, err);
+    }
+}
+
+/* --- RTC, time and sleep ---------------------------------------------------
+ *
+ * Every verb here works on this board, or -- with a 0x.... / ALL address
+ * right after the verb -- on remote nodes through the gateway. Local answers
+ * use the same line a remote node's answer produces on the bridge:
+ *
+ *     RTC <addr> <OK|BAD_ARG|REFUSED|FAILED> time=... valid=... backend=...
+ *                wake=... duty=...
+ */
+
+/* A leading "0x...." or "ALL" token selects a remote target. Plain numbers
+ * are deliberately not addresses here: "TIME SET 1790000000" is an epoch. */
+static bool take_remote(const char *args, uint16_t *dst, const char **rest)
+{
+    char        tok[16];
+    const char *after = NULL;
+
+    if (!split_token(args, tok, sizeof(tok), &after)) {
+        return false;
+    }
+    if (strncasecmp(tok, "0x", 2) != 0 && strcasecmp(tok, "ALL") != 0) {
+        return false;
+    }
+    if (!parse_target(tok, dst)) {
+        return false;
+    }
+    *rest = after;
+    return true;
+}
+
+static void rtc_report_local(cmd_proto_ctx_t *ctx, esp_err_t result)
+{
+    rtc_status_t st;
+    char         status[112];
+    char         addr[DEV_ATTR_MAX_VALUE_LEN + 1];
+    char         msg[160];
+
+    if (dev_identity_get_text(DEV_ATTR_UNICAST, addr, sizeof(addr)) != ESP_OK) {
+        snprintf(addr, sizeof(addr), "0x0000");
+    }
+    rtc_mgr_status(&st);
+    rtc_mgr_format_status(&st, status, sizeof(status));
+    snprintf(msg, sizeof(msg), "RTC %s %s %s", addr,
+             rtc_mgr_result_name(rtc_mgr_result_code(result)), status);
+    reply(ctx, msg);
+}
+
+/* Says why a local request was refused, in words a person can act on. */
+static void rtc_err_reply(cmd_proto_ctx_t *ctx, const rtc_req_t *req, esp_err_t err)
+{
+    if (err == ESP_ERR_INVALID_STATE) {
+        if (device_mode_get() == DEVICE_MODE_GATEWAY &&
+            (req->op == RTC_REQ_SLEEP || req->op == RTC_REQ_DUTY)) {
+            reply(ctx, "ERR a gateway does not sleep");
+        } else {
+            reply(ctx, "ERR clock not set (TIME SET first)");
+        }
+    } else if (err == ESP_ERR_INVALID_ARG) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "ERR out of range (awake >= %u s, sleep <= 7 days)",
+                 (unsigned)RTC_DUTY_MIN_AWAKE_S);
+        reply(ctx, msg);
+    } else {
+        mesh_err_reply(ctx, err);
+    }
+}
+
+/* Parses the part of TIME SET / SLEEP / DUTY after the optional address into
+ * a request. `verb` picks the grammar. Replies with ERR and returns false on a
+ * malformed line. */
+static bool parse_rtc_req(cmd_proto_ctx_t *ctx, const char *verb, const char *args,
+                          rtc_req_t *req)
+{
+    char        tok[32];
+    const char *rest = NULL;
+    time_t      now;
+    bool        valid;
+
+    rtc_mgr_get_time(&now, &valid);
+    memset(req, 0, sizeof(*req));
+
+    if (strcasecmp(verb, "TIME") == 0) {
+        time_t t;
+        if (!rtc_mgr_parse_time(args, now, &t)) {
+            reply(ctx, "ERR usage: TIME SET [addr|ALL] <epoch|YYYY-MM-DDTHH:MM:SS>");
+            return false;
+        }
+        req->op = RTC_REQ_TIME_SET;
+        req->a = (uint32_t)t;
+        return true;
+    }
+
+    if (!split_token(args, tok, sizeof(tok), &rest)) {
+        goto usage;
+    }
+
+    if (strcasecmp(verb, "DUTY") == 0 && strcasecmp(tok, "OFF") == 0) {
+        req->op = RTC_REQ_DUTY_OFF;
+        return true;
+    }
+    if (!rtc_mgr_parse_mode(tok, &req->mode)) {
+        goto usage;
+    }
+
+    if (strcasecmp(verb, "SLEEP") == 0) {
+        req->op = RTC_REQ_SLEEP;
+        if (!split_token(rest, tok, sizeof(tok), &rest)) {
+            goto usage;
+        }
+        if (strcasecmp(tok, "UNTIL") == 0) {
+            time_t t;
+            if (!rtc_mgr_parse_time(rest, now, &t)) {
+                goto usage;
+            }
+            req->absolute = true;
+            req->a = (uint32_t)t;
+            return true;
+        }
+        char *end;
+        req->a = (uint32_t)strtoul(tok, &end, 10);
+        if (*end != '\0') {
+            goto usage;
+        }
+        return true;
+    }
+
+    /* DUTY <mode> <awake_s> <sleep_s> [ALIGN] */
+    req->op = RTC_REQ_DUTY;
+    char  a[12], b[12];
+    char *end_a, *end_b;
+    if (!split_token(rest, a, sizeof(a), &rest) || !split_token(rest, b, sizeof(b), &rest)) {
+        goto usage;
+    }
+    req->a = (uint32_t)strtoul(a, &end_a, 10);
+    req->b = (uint32_t)strtoul(b, &end_b, 10);
+    if (*end_a != '\0' || *end_b != '\0') {
+        goto usage;
+    }
+    if (*rest != '\0') {
+        if (strcasecmp(rest, "ALIGN") != 0) {
+            goto usage;
+        }
+        req->absolute = true;
+    }
+    return true;
+
+usage:
+    if (strcasecmp(verb, "SLEEP") == 0) {
+        reply(ctx, "ERR usage: SLEEP [addr|ALL] <LIGHT|DEEP> <seconds | UNTIL time>");
+    } else {
+        reply(ctx, "ERR usage: DUTY [addr|ALL] <LIGHT|DEEP> <awake_s> <sleep_s> [ALIGN] | OFF");
+    }
+    return false;
+}
+
+static void rtc_send_remote(cmd_proto_ctx_t *ctx, uint16_t dst, const rtc_req_t *req)
+{
+    if (s_mesh == NULL || s_mesh->rtc == NULL) {
+        reply(ctx, "ERR mesh not available");
+        return;
+    }
+    esp_err_t err = s_mesh->rtc(dst, req);
+    if (err == ESP_OK) {
+        char msg[32];
+        snprintf(msg, sizeof(msg), "RTC 0x%04x sent", dst);
+        reply(ctx, msg);
+    } else {
+        mesh_err_reply(ctx, err);
+    }
+}
+
+/* RTC | RTC? | RTC <addr|ALL> */
+static void rtc_command(cmd_proto_ctx_t *ctx, const char *args)
+{
+    uint16_t    dst;
+    const char *rest = NULL;
+
+    if (args == NULL) {
+        rtc_report_local(ctx, ESP_OK);
+        return;
+    }
+    if (!take_remote(args, &dst, &rest) || *rest != '\0') {
+        reply(ctx, "ERR usage: RTC [addr|ALL]");
+        return;
+    }
+    rtc_req_t req = { .op = RTC_REQ_GET };
+    rtc_send_remote(ctx, dst, &req);
+}
+
+/* TIME SET ... / TIME SYNC <addr|ALL> / SLEEP ... / DUTY ... */
+static void rtc_verb(cmd_proto_ctx_t *ctx, const char *verb, const char *args)
+{
+    uint16_t    dst;
+    const char *rest = NULL;
+    bool        remote = take_remote(args, &dst, &rest);
+    rtc_req_t   req;
+
+    if (strcasecmp(verb, "SYNC") == 0) {
+        /* Push this board's clock to others: the one way to set a whole
+         * network from a single trusted source. */
+        time_t now;
+        bool   valid;
+        rtc_mgr_get_time(&now, &valid);
+        if (!remote || *rest != '\0') {
+            reply(ctx, "ERR usage: TIME SYNC <addr|ALL>");
+            return;
+        }
+        if (!valid) {
+            reply(ctx, "ERR clock not set (TIME SET first)");
+            return;
+        }
+        req = (rtc_req_t){ .op = RTC_REQ_TIME_SET, .a = (uint32_t)now };
+        rtc_send_remote(ctx, dst, &req);
+        return;
+    }
+
+    if (!parse_rtc_req(ctx, verb, remote ? rest : args, &req)) {
+        return;
+    }
+    if (remote) {
+        rtc_send_remote(ctx, dst, &req);
+        return;
+    }
+
+    esp_err_t err = rtc_mgr_apply(&req);
+    if (err != ESP_OK) {
+        rtc_err_reply(ctx, &req, err);
+    } else if (req.op == RTC_REQ_SLEEP) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "SLEEP %s %s %u (in %u ms)",
+                 rtc_mgr_mode_name(req.mode), req.absolute ? "until" : "for",
+                 (unsigned)req.a, (unsigned)RTC_SLEEP_GRACE_MS);
+        reply(ctx, msg);
+    } else {
+        rtc_report_local(ctx, ESP_OK);
+    }
+}
+
 /* --- Help menu ------------------------------------------------------------ */
 
 /* One row per command form. A verb may span several rows (ASK does); HELP with
@@ -401,6 +701,15 @@ static const cmd_help_row_t s_help_rows[] = {
     { "SEND", "SEND <addr|ALL> <text>",           "send text to remote nodes (gateway)" },
     { "TELEM","TELEM <addr|ALL>",                 "live vitals: uptime, heap, battery, RSSI (gateway)" },
     { "NODES","NODES",                            "list nodes this gateway has provisioned" },
+    { "NEIGHBORS", "NEIGHBORS",                   "nodes this board hears directly (RSSI, age)" },
+    { "NEIGHBORS", "NEIGHBORS <addr|ALL>",        "a remote node's neighbors, or every node's (gateway)" },
+    { "RTC",  "RTC [addr|ALL]",                   "clock, wake cause and duty cycle" },
+    { "TIME", "TIME SET [addr|ALL] <epoch|ISO>",  "set the clock (UTC)" },
+    { "TIME", "TIME SYNC <addr|ALL>",             "push this board's clock to nodes (gateway)" },
+    { "SLEEP","SLEEP [addr] <LIGHT|DEEP> <s>",    "sleep for s seconds (not on a gateway)" },
+    { "SLEEP","SLEEP [addr] <mode> UNTIL <time>", "sleep until a UTC time (epoch/ISO/HH:MM)" },
+    { "DUTY", "DUTY [addr] <mode> <on_s> <off_s>","repeat awake/asleep; add ALIGN for clock marks" },
+    { "DUTY", "DUTY [addr|ALL] OFF",              "stop the duty cycle" },
     { "HELP", "HELP [command] | <command> --help", "show this menu" },
 };
 
@@ -415,6 +724,7 @@ static void report_help_attrs(cmd_proto_ctx_t *ctx)
         const char *name = dev_attr_at(i)->name;
         int n = snprintf(line + used, sizeof(line) - used, " %s", name);
         if (n <= 0 || (size_t)n >= sizeof(line) - used) {
+            line[used] = '\0';      /* drop the partial name snprintf left behind */
             reply(ctx, line);
             used = (size_t)snprintf(line, sizeof(line), "HELP attrs: %s", name);
             continue;
@@ -509,6 +819,22 @@ static void handle_line(cmd_proto_ctx_t *ctx, char *line)
         telem_query(ctx, rest);
     } else if (line_is(line, "NODES") || line_is(line, "NODES?")) {
         list_nodes(ctx);
+    } else if (line_is(line, "NEIGHBORS") || line_is(line, "NEIGHBORS?")) {
+        neighbors_local(ctx);
+    } else if (line_starts_with(line, "NEIGHBORS", &rest)) {
+        neighbors_query(ctx, rest);
+    } else if (line_is(line, "RTC") || line_is(line, "RTC?")) {
+        rtc_command(ctx, NULL);
+    } else if (line_starts_with(line, "RTC", &rest)) {
+        rtc_command(ctx, rest);
+    } else if (line_starts_with(line, "TIME SET", &rest)) {
+        rtc_verb(ctx, "TIME", rest);
+    } else if (line_starts_with(line, "TIME SYNC", &rest)) {
+        rtc_verb(ctx, "SYNC", rest);
+    } else if (line_starts_with(line, "SLEEP", &rest)) {
+        rtc_verb(ctx, "SLEEP", rest);
+    } else if (line_starts_with(line, "DUTY", &rest)) {
+        rtc_verb(ctx, "DUTY", rest);
     } else {
         reply(ctx, "ERR unknown command (try HELP)");
     }

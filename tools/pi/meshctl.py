@@ -46,7 +46,7 @@ SPI_FRAG_END = 0x02    # last fragment of a longer line
 SPI_SETTLE_S = 0.15
 
 ASYNC_PREFIXES = ("JOINED", "READY", "MSG", "ATTR", "ATTRSET", "TEXT",
-                  "NODE", "NODES", "TELEM")
+                  "NODE", "NODES", "TELEM", "NEIGH", "NEIGHBORS", "RTC")
 
 # Reply collection: a command's reply is done after this much silence.
 QUIET_WINDOW_S = 0.3
@@ -364,6 +364,141 @@ def parse_telem_line(line):
     }
 
 
+def parse_neigh_line(line):
+    """NEIGH 0x0005 0x0001 rssi=-42 avg=-44 age=3 n=57 -- one entry of the
+    reporter's (first address) table: the peer it hears directly."""
+    parts = line.split(None, 3)
+    if len(parts) < 4 or parts[0] != "NEIGH":
+        return None
+    try:
+        reporter, addr = int(parts[1], 16), int(parts[2], 16)
+    except ValueError:
+        return None
+    f = _kv(parts[3])
+
+    def num(key):
+        try:
+            return int(f[key])
+        except (KeyError, ValueError):
+            return None
+
+    return {
+        "reporter": reporter,
+        "addr": addr,
+        "rssi": num("rssi"),
+        "rssi_avg": num("avg"),
+        "age_s": num("age"),
+        "heard": num("n"),
+    }
+
+
+def parse_neighbors_end(line):
+    """The line closing one reporter's table.
+
+    Returns (reporter, count) for "NEIGHBORS 0x0005 count=2", (reporter, None)
+    for "NEIGHBORS 0x0005 noreply", and None for anything else -- including the
+    "sent" / "ALL started" acknowledgements and the "ALL done" summary.
+    """
+    parts = line.split()
+    if len(parts) != 3 or parts[0] != "NEIGHBORS":
+        return None
+    try:
+        reporter = int(parts[1], 16)
+    except ValueError:
+        return None
+    if parts[2] == "noreply":
+        return reporter, None
+    if parts[2].startswith("count="):
+        try:
+            return reporter, int(parts[2][6:])
+        except ValueError:
+            return None
+    return None
+
+
+def fold_neighbors(lines):
+    """Group NEIGH/NEIGHBORS lines by reporter.
+
+    Returns (tables, silent): {reporter: [entry, ...]} for every reporter whose
+    table closed, including empty ones, and the reporters that did not answer.
+    """
+    pending, tables, silent = {}, {}, []
+    for line in lines:
+        entry = parse_neigh_line(line)
+        if entry:
+            pending.setdefault(entry["reporter"], []).append(entry)
+            continue
+        end = parse_neighbors_end(line)
+        if end is None:
+            continue
+        reporter, count = end
+        if count is None:
+            silent.append(reporter)
+            pending.pop(reporter, None)
+        else:
+            tables[reporter] = pending.pop(reporter, [])
+    return tables, silent
+
+
+RTC_VERBS = ("RTC", "RTC?", "TIME", "SLEEP", "DUTY")
+
+
+def parse_rtc_line(line):
+    """RTC 0x0005 OK time=2026-09-30T12:00:00Z valid=1 backend=INTERNAL
+    wake=TIMER duty=deep/10/300/align -- or "RTC 0x0005 noreply".
+
+    None for anything else, including the "RTC 0x0005 sent" acknowledgement.
+    """
+    parts = line.split(None, 3)
+    if len(parts) < 3 or parts[0] != "RTC":
+        return None
+    try:
+        addr = int(parts[1], 16)
+    except ValueError:
+        return None
+    if parts[2] == "noreply":
+        return {"addr": addr, "result": "NOREPLY"}
+    if parts[2] == "sent" or len(parts) < 4:
+        return None
+
+    f = _kv(parts[3])
+    duty = None
+    if f.get("duty", "off") != "off":
+        d = f["duty"].split("/")
+        try:
+            duty = {"mode": d[0], "awake_s": int(d[1]), "sleep_s": int(d[2]),
+                    "align": len(d) > 3 and d[3] == "align"}
+        except (IndexError, ValueError):
+            duty = None
+    return {
+        "addr": addr,
+        "result": parts[2],
+        "time": f.get("time"),
+        "valid": f.get("valid") == "1",
+        "backend": f.get("backend"),
+        "wake": f.get("wake"),
+        "duty": duty,
+    }
+
+
+def _rtc_target(words):
+    """Where an RTC/TIME/SLEEP/DUTY command line is aimed: a unicast int,
+    "ALL", or None for the attached board. Mirrors the firmware rule that a
+    remote address is written 0x.... or ALL, right after the verb."""
+    idx = 2 if words and words[0].upper() == "TIME" else 1
+    if len(words) <= idx:
+        return None
+    tok = words[idx]
+    if tok.upper() == "ALL":
+        return "ALL"
+    if tok.lower().startswith("0x"):
+        try:
+            return int(tok, 16)
+        except ValueError:
+            return None
+    return None
+
+
 # "ID <ATTR> <value>" maps onto the same record shape parse_telem_line
 # produces, so the attached board can sit in the same table as remote nodes.
 ID_FIELD_MAP = {
@@ -575,6 +710,123 @@ class MeshLink:
                 missing.append(addr)
         return found, missing
 
+    # A remote NEIGHBORS waits on the client model's ~4 s timeout before the
+    # gateway reports "noreply", so the host must wait a little longer still.
+    NEIGH_REMOTE_TIMEOUT_S = 7.0
+    # The gateway asks one node at a time, allowing each up to 6 s.
+    NEIGH_PER_NODE_S = 6.5
+
+    def _raise_errors(self, others, have_results):
+        errors = [l for l in others if l.startswith("ERR")]
+        if errors and not have_results:
+            raise RuntimeError("; ".join(errors))
+
+    def neighbors_lines(self, target=None, timeout=None):
+        """Send NEIGHBORS [target] and return every NEIGH/NEIGHBORS line up to
+        and including the one that closes the answer, plus unrelated lines.
+
+        `target` is None (the attached board), a unicast int, or "ALL".
+        """
+        if target is None:
+            cmd, want = "NEIGHBORS", None
+            timeout = timeout or 2.0
+        elif isinstance(target, str) and target.upper() == "ALL":
+            cmd, want = "NEIGHBORS ALL", "ALL"
+            if timeout is None:
+                try:
+                    count = len(self.nodes())
+                except RuntimeError:
+                    count = 0   # not a gateway; the command itself will say so
+                timeout = self.NEIGH_PER_NODE_S * max(1, count) + 3.0
+        else:
+            addr = target if isinstance(target, int) else int(target, 0)
+            cmd, want = "NEIGHBORS 0x%04x" % addr, addr
+            timeout = timeout or self.NEIGH_REMOTE_TIMEOUT_S
+
+        def done(line):
+            if line.startswith("ERR"):
+                return True
+            if want == "ALL":
+                return line.startswith("NEIGHBORS ALL done")
+            end = parse_neighbors_end(line)
+            if end is None:
+                return False
+            # Local: the board answers under its own address, whatever it is.
+            # Remote: only the asked node's terminator ends the wait.
+            return want is None or end[0] == want
+
+        return self._gather(cmd, "NEIGH", timeout, done=done)
+
+    def neighbors(self, target=None, timeout=None):
+        """One board's direct neighbors, strongest first.
+
+        With no target, the attached board's own table (works in NODE mode
+        too). With a unicast address, the gateway asks that node over the mesh.
+        Returns a list of entries, or None if the node did not answer.
+        """
+        lines, others = self.neighbors_lines(target, timeout)
+        tables, silent = fold_neighbors(lines)
+        self._raise_errors(others, tables or silent)
+        if not tables:
+            return None
+        if target is None:
+            return next(iter(tables.values()))
+        addr = target if isinstance(target, int) else int(target, 0)
+        return tables.get(addr)
+
+    def neighbors_all(self, timeout=None):
+        """Every provisioned node's neighbor table, gathered by the gateway in
+        a single NEIGHBORS ALL sweep.
+
+        Returns (tables, missing): {reporter: [entry, ...]} and the nodes that
+        did not answer.
+        """
+        lines, others = self.neighbors_lines("ALL", timeout)
+        tables, silent = fold_neighbors(lines)
+        self._raise_errors(others, tables or silent)
+        return tables, silent
+
+    def neighbors_sweep(self, addrs, timeout=None):
+        """Like neighbors_all, but driven from the host one unicast query at a
+        time -- for asking a chosen subset of nodes."""
+        tables, missing = {}, []
+        for addr in addrs:
+            got = self.neighbors(addr, timeout=timeout)
+            if got is None:
+                missing.append(addr)
+            else:
+                tables[addr] = got
+        return tables, missing
+
+    def rtc_lines(self, cmd, timeout=7.0):
+        """Run one RTC / TIME / SLEEP / DUTY command line and wait for its
+        answer: immediate for the attached board, a few seconds later for a
+        remote node (whose "RTC <addr> ..." line follows the "sent" ack).
+
+        A command to ALL returns after the ack: group replies never reach the
+        gateway's application, so there is nothing further to wait for.
+        Returns (lines, others) like _gather.
+        """
+        target = _rtc_target(cmd.split())
+
+        def done(line):
+            if line.startswith("ERR") or line.startswith("SLEEP "):
+                return True
+            if line.startswith("RTC ") and line.endswith(" sent"):
+                return target == "ALL"
+            rec = parse_rtc_line(line)
+            return rec is not None and (not isinstance(target, int)
+                                        or rec["addr"] == target)
+
+        return self._gather(cmd, "RTC ", timeout, done=done)
+
+    def rtc(self, cmd, timeout=7.0):
+        """Like rtc_lines, parsed: a list of RTC records (usually one)."""
+        lines, others = self.rtc_lines(cmd, timeout)
+        recs = [r for r in (parse_rtc_line(l) for l in lines) if r]
+        self._raise_errors(others, recs)
+        return recs
+
     def ask_sweep(self, addrs, attrs=(), timeout=2.0):
         """Unicast ASK per address, for the same reason as telem_sweep."""
         found = {}
@@ -715,7 +967,8 @@ def main():
     ap.add_argument("--speed", type=int, default=1_000_000,
                     help="SPI clock in Hz")
     ap.add_argument("--json", action="store_true",
-                    help="for NODES and TELEM, print parsed JSON instead of raw lines")
+                    help="for NODES, TELEM and NEIGHBORS, print parsed JSON "
+                         "instead of raw lines")
     ap.add_argument("command", nargs=argparse.REMAINDER,
                     help="command to send (omit for interactive mode)")
     args = ap.parse_args()
@@ -742,9 +995,50 @@ def main():
             return run_repl(tr, args.spi is not None)
 
         cmd = " ".join(args.command)
+        verb = args.command[0].upper()
+        target = args.command[1] if len(args.command) > 1 else None
+
+        if verb == "NEIGHBORS":
+            # A remote answer arrives seconds later, and a sweep streams for as
+            # long as it takes to ask every node -- well past the quiet window
+            # a one-shot waits for -- so wait for the closing line instead.
+            link = MeshLink(transport=tr)
+            if args.json:
+                if target is not None and target.upper() == "ALL":
+                    tables, missing = link.neighbors_all()
+                    print(json.dumps({"neighbors": {"0x%04x" % k: v
+                                                    for k, v in tables.items()},
+                                      "no_reply": ["0x%04x" % a for a in missing]},
+                                     indent=2))
+                    return 0
+                got = link.neighbors(target)
+                print(json.dumps(got, indent=2))
+                return 0 if got is not None else 1
+            lines, others = link.neighbors_lines(target)
+            for line in others + lines:
+                print(line)
+            if not lines and not others:
+                print("(no reply)", file=sys.stderr)
+                return 1
+            return 1 if any(l.startswith("ERR") for l in others) else 0
+
+        if verb in RTC_VERBS:
+            link = MeshLink(transport=tr)
+            if args.json:
+                print(json.dumps(link.rtc(cmd), indent=2))
+                return 0
+            lines, others = link.rtc_lines(cmd)
+            for line in others + lines:
+                print(line)
+            if not lines and not others:
+                print("(no reply)", file=sys.stderr)
+                return 1
+            bad = [l for l in others + lines
+                   if l.startswith("ERR") or l.endswith(" noreply")]
+            return 1 if bad else 0
+
         if args.json:
             link = MeshLink(transport=tr)
-            verb = args.command[0].upper()
             if verb == "NODES":
                 print(json.dumps(link.nodes(), indent=2))
                 return 0
@@ -753,7 +1047,8 @@ def main():
                 found, _ = link.telem(target)
                 print(json.dumps(list(found.values()), indent=2))
                 return 0
-            print("--json only applies to NODES and TELEM", file=sys.stderr)
+            print("--json only applies to NODES, TELEM, NEIGHBORS and the RTC verbs",
+                  file=sys.stderr)
             return 2
 
         return run_oneshot(tr, cmd)

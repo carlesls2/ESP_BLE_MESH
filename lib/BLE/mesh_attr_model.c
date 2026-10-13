@@ -16,6 +16,7 @@
 
 #include "dev_identity.h"
 #include "device_mode.h"
+#include "neighbor.h"
 #include "telemetry.h"
 
 #define TAG "ATTR_MDL"
@@ -29,6 +30,11 @@
 #define OP_ATTR_MSG        ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_MSG,        CID_ESP)
 #define OP_TELEM_GET       ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_TELEM_GET,    CID_ESP)
 #define OP_TELEM_STATUS    ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_TELEM_STATUS, CID_ESP)
+#define OP_NEIGH_GET       ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_NEIGH_GET,    CID_ESP)
+#define OP_NEIGH_STATUS    ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_NEIGH_STATUS, CID_ESP)
+#define OP_NEIGH_HELLO     ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_NEIGH_HELLO,  CID_ESP)
+#define OP_RTC_SET         ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_RTC_SET,      CID_ESP)
+#define OP_RTC_STATUS      ESP_BLE_MESH_MODEL_OP_3(MESH_ATTR_OP_B0_RTC_STATUS,   CID_ESP)
 
 /* Longest id list a GET may carry. Past this, asking for everything (count 0)
  * is cheaper anyway. */
@@ -44,6 +50,13 @@
 #define REPLY_TASK_STK 3584
 #define REPLY_TASK_PRI 9
 
+/* HELLO cadence: a random interval so boards powered up together drift apart
+ * instead of colliding on every beat. */
+#define HELLO_MIN_MS   8000
+#define HELLO_MAX_MS   12000
+#define HELLO_TASK_STK 2560
+#define HELLO_TASK_PRI 5
+
 /* Enough for the worst-case TLV reply holding every attribute. */
 #define ATTR_MSG_BUF_LEN DEV_ATTR_MAX_TLV_LEN
 
@@ -52,10 +65,13 @@
 typedef enum {
     REPLY_KIND_ATTRS = 0,
     REPLY_KIND_TELEM = 1,
+    REPLY_KIND_NEIGH = 2,
+    REPLY_KIND_RTC   = 3,
 } reply_kind_t;
 
 typedef struct {
     reply_kind_t  kind;
+    uint8_t       result;                    /* REPLY_KIND_RTC: RTC_RESULT_* */
     uint16_t      dst;
     uint16_t      net_idx;
     uint16_t      app_idx;
@@ -69,6 +85,9 @@ static esp_ble_mesh_model_op_t s_server_ops[] = {
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_SET, 3),
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_MSG, 1),
     ESP_BLE_MESH_MODEL_OP(OP_TELEM_GET, 1),
+    ESP_BLE_MESH_MODEL_OP(OP_NEIGH_GET, 1),
+    ESP_BLE_MESH_MODEL_OP(OP_NEIGH_HELLO, 1),
+    ESP_BLE_MESH_MODEL_OP(OP_RTC_SET, sizeof(mesh_rtc_cmd_t)),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
@@ -76,6 +95,8 @@ static esp_ble_mesh_model_op_t s_client_ops[] = {
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_STATUS, 2),
     ESP_BLE_MESH_MODEL_OP(OP_ATTR_SET_STATUS, 1),
     ESP_BLE_MESH_MODEL_OP(OP_TELEM_STATUS, sizeof(mesh_telem_t)),
+    ESP_BLE_MESH_MODEL_OP(OP_NEIGH_STATUS, sizeof(mesh_neigh_hdr_t)),
+    ESP_BLE_MESH_MODEL_OP(OP_RTC_STATUS, sizeof(mesh_rtc_status_t)),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
@@ -83,6 +104,8 @@ static const esp_ble_mesh_client_op_pair_t s_client_op_pair[] = {
     { OP_ATTR_GET, OP_ATTR_STATUS },
     { OP_ATTR_SET, OP_ATTR_SET_STATUS },
     { OP_TELEM_GET, OP_TELEM_STATUS },
+    { OP_NEIGH_GET, OP_NEIGH_STATUS },
+    { OP_RTC_SET, OP_RTC_STATUS },
 };
 
 static esp_ble_mesh_client_t s_attr_client = {
@@ -105,16 +128,25 @@ static mesh_attr_status_cb_t     s_status_cb = NULL;
 static mesh_attr_set_status_cb_t s_set_status_cb = NULL;
 static mesh_attr_text_cb_t       s_text_cb = NULL;
 static mesh_attr_telem_cb_t      s_telem_cb = NULL;
+static mesh_attr_neigh_cb_t      s_neigh_cb = NULL;
+static mesh_attr_rtc_cb_t        s_rtc_cb = NULL;
+
+void mesh_attr_model_register_rtc_cb(mesh_attr_rtc_cb_t rtc_cb)
+{
+    s_rtc_cb = rtc_cb;
+}
 
 void mesh_attr_model_register_cbs(mesh_attr_status_cb_t status_cb,
                                   mesh_attr_set_status_cb_t set_status_cb,
                                   mesh_attr_text_cb_t text_cb,
-                                  mesh_attr_telem_cb_t telem_cb)
+                                  mesh_attr_telem_cb_t telem_cb,
+                                  mesh_attr_neigh_cb_t neigh_cb)
 {
     s_status_cb = status_cb;
     s_set_status_cb = set_status_cb;
     s_text_cb = text_cb;
     s_telem_cb = telem_cb;
+    s_neigh_cb = neigh_cb;
 }
 
 /* --- Server side: answering ---------------------------------------------- */
@@ -186,6 +218,81 @@ static void send_telem(const reply_req_t *req)
     }
 }
 
+static void send_neigh(const reply_req_t *req)
+{
+    neighbor_entry_t entries[NEIGH_MAX];
+    size_t           n = neighbor_snapshot(entries, NEIGH_MAX);
+
+    uint8_t          body[sizeof(mesh_neigh_hdr_t) + NEIGH_MAX * sizeof(mesh_neigh_wire_t)];
+    mesh_neigh_hdr_t hdr = { .ver = MESH_NEIGH_VER, .count = (uint8_t)n };
+    size_t           len = 0;
+
+    memcpy(body, &hdr, sizeof(hdr));
+    len += sizeof(hdr);
+    for (size_t i = 0; i < n; i++) {
+        mesh_neigh_wire_t w = {
+            .addr      = entries[i].addr,
+            .rssi_last = entries[i].rssi_last,
+            .rssi_avg  = entries[i].rssi_avg,
+            .age_s     = entries[i].age_s,
+            .heard     = entries[i].heard,
+        };
+        memcpy(body + len, &w, sizeof(w));
+        len += sizeof(w);
+    }
+
+    esp_ble_mesh_msg_ctx_t ctx = {
+        .net_idx  = req->net_idx,
+        .app_idx  = req->app_idx,
+        .addr     = req->dst,
+        .send_ttl = ESP_BLE_MESH_TTL_DEFAULT,
+        .send_rel = false,
+    };
+
+    esp_err_t err = esp_ble_mesh_server_model_send_msg(MODEL_SERVER, &ctx, OP_NEIGH_STATUS,
+                                                      (uint16_t)len, body);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to send neighbors to 0x%04x: %d", req->dst, err);
+    } else {
+        ESP_LOGI(TAG, "%u neighbor(s) sent to 0x%04x (%u bytes)", (unsigned)n, req->dst,
+                 (unsigned)len);
+    }
+}
+
+static void send_rtc_status(const reply_req_t *req)
+{
+    rtc_status_t st;
+    rtc_mgr_status(&st);
+
+    mesh_rtc_status_t body = {
+        .ver        = MESH_RTC_VER,
+        .result     = req->result,
+        .valid      = st.valid,
+        .backend    = (uint8_t)st.backend,
+        .now        = (uint32_t)st.now,
+        .wake       = (uint8_t)st.wake,
+        .duty_on    = st.duty.enabled,
+        .duty_mode  = (uint8_t)st.duty.mode,
+        .duty_align = st.duty.align,
+        .awake_s    = st.duty.awake_s,
+        .sleep_s    = st.duty.sleep_s,
+    };
+
+    esp_ble_mesh_msg_ctx_t ctx = {
+        .net_idx  = req->net_idx,
+        .app_idx  = req->app_idx,
+        .addr     = req->dst,
+        .send_ttl = ESP_BLE_MESH_TTL_DEFAULT,
+        .send_rel = false,
+    };
+
+    esp_err_t err = esp_ble_mesh_server_model_send_msg(MODEL_SERVER, &ctx, OP_RTC_STATUS,
+                                                      sizeof(body), (uint8_t *)&body);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to send rtc status to 0x%04x: %d", req->dst, err);
+    }
+}
+
 /* Replies leave from here rather than from the mesh callback, so a segmented
  * transmission never blocks the stack's own task and the stagger delay has
  * somewhere to sleep. */
@@ -205,6 +312,10 @@ static void reply_task(void *arg)
         }
         if (req.kind == REPLY_KIND_TELEM) {
             send_telem(&req);
+        } else if (req.kind == REPLY_KIND_NEIGH) {
+            send_neigh(&req);
+        } else if (req.kind == REPLY_KIND_RTC) {
+            send_rtc_status(&req);
         } else {
             send_status(&req);
         }
@@ -263,6 +374,64 @@ static void handle_telem_get(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg, ui
 
     if (xQueueSend(s_reply_q, &req, 0) != pdTRUE) {
         ESP_LOGW(TAG, "reply queue full, dropping telemetry query from 0x%04x", ctx->addr);
+    }
+}
+
+static void handle_neigh_get(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg, uint16_t len)
+{
+    if (len >= 1 && msg[0] != MESH_NEIGH_VER) {
+        ESP_LOGW(TAG, "0x%04x asked for neighbors v%u, sending v%u",
+                 ctx->addr, msg[0], MESH_NEIGH_VER);
+    }
+
+    reply_req_t req = {
+        .kind    = REPLY_KIND_NEIGH,
+        .dst     = ctx->addr,
+        .net_idx = ctx->net_idx,
+        .app_idx = ctx->app_idx,
+        .stagger = !ESP_BLE_MESH_ADDR_IS_UNICAST(ctx->recv_dst),
+    };
+
+    if (xQueueSend(s_reply_q, &req, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "reply queue full, dropping neighbor query from 0x%04x", ctx->addr);
+    }
+}
+
+/* Applied on the spot -- setting the clock or queueing a sleep is quick -- and
+ * answered through the reply task like every other query. A queued sleep
+ * waits RTC_SLEEP_GRACE_MS, which is what lets this answer get out first. */
+static void handle_rtc_set(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg, uint16_t len)
+{
+    mesh_rtc_cmd_t cmd;
+    memcpy(&cmd, msg, sizeof(cmd));
+
+    uint8_t result;
+    if (cmd.ver != MESH_RTC_VER) {
+        ESP_LOGW(TAG, "0x%04x speaks rtc v%u, we speak v%u", ctx->addr, cmd.ver, MESH_RTC_VER);
+        result = RTC_RESULT_FAILED;
+    } else {
+        rtc_req_t req = {
+            .op       = (rtc_req_op_t)cmd.op,
+            .mode     = cmd.mode ? RTC_SLEEP_DEEP : RTC_SLEEP_LIGHT,
+            .absolute = cmd.absolute != 0,
+            .a        = cmd.a,
+            .b        = cmd.b,
+        };
+        result = rtc_mgr_result_code(rtc_mgr_apply(&req));
+        ESP_LOGI(TAG, "rtc op %u from 0x%04x: %s", cmd.op, ctx->addr,
+                 rtc_mgr_result_name(result));
+    }
+
+    reply_req_t rsp = {
+        .kind    = REPLY_KIND_RTC,
+        .result  = result,
+        .dst     = ctx->addr,
+        .net_idx = ctx->net_idx,
+        .app_idx = ctx->app_idx,
+        .stagger = !ESP_BLE_MESH_ADDR_IS_UNICAST(ctx->recv_dst),
+    };
+    if (xQueueSend(s_reply_q, &rsp, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "reply queue full, dropping rtc answer to 0x%04x", ctx->addr);
     }
 }
 
@@ -399,6 +568,69 @@ static void handle_telem_status(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg,
     }
 }
 
+static void handle_neigh_status(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg,
+                                uint16_t len)
+{
+    mesh_neigh_hdr_t  hdr;
+    mesh_neigh_wire_t entries[NEIGH_MAX];
+
+    /* The op table guarantees len >= sizeof(hdr). */
+    memcpy(&hdr, msg, sizeof(hdr));
+    if (hdr.ver != MESH_NEIGH_VER) {
+        ESP_LOGW(TAG, "0x%04x speaks neighbors v%u, we speak v%u -- ignoring",
+                 ctx->addr, hdr.ver, MESH_NEIGH_VER);
+        return;
+    }
+
+    size_t count = hdr.count;
+    size_t fit = (len - sizeof(hdr)) / sizeof(mesh_neigh_wire_t);
+    if (count > fit) {
+        ESP_LOGW(TAG, "0x%04x claims %u neighbors, carries %u",
+                 ctx->addr, (unsigned)count, (unsigned)fit);
+        count = fit;
+    }
+    if (count > NEIGH_MAX) {
+        count = NEIGH_MAX;
+    }
+    /* Copied out: the receive buffer has no alignment guarantee. */
+    memcpy(entries, msg + sizeof(hdr), count * sizeof(mesh_neigh_wire_t));
+
+    ESP_LOGI(TAG, "%u neighbor(s) from 0x%04x", (unsigned)count, ctx->addr);
+    if (s_neigh_cb) {
+        s_neigh_cb(ctx->addr, entries, count);
+    }
+}
+
+static void handle_rtc_status(esp_ble_mesh_msg_ctx_t *ctx, const uint8_t *msg,
+                              uint16_t len)
+{
+    mesh_rtc_status_t w;
+    memcpy(&w, msg, sizeof(w));     /* op table guarantees the length */
+
+    if (w.ver != MESH_RTC_VER) {
+        ESP_LOGW(TAG, "0x%04x speaks rtc v%u, we speak v%u -- ignoring",
+                 ctx->addr, w.ver, MESH_RTC_VER);
+        return;
+    }
+
+    rtc_status_t st = {
+        .now     = (time_t)w.now,
+        .valid   = w.valid != 0,
+        .backend = (rtc_backend_t)w.backend,
+        .wake    = (rtc_wake_cause_t)w.wake,
+        .duty    = {
+            .enabled = w.duty_on != 0,
+            .mode    = w.duty_mode ? RTC_SLEEP_DEEP : RTC_SLEEP_LIGHT,
+            .align   = w.duty_align != 0,
+            .awake_s = w.awake_s,
+            .sleep_s = w.sleep_s,
+        },
+    };
+    if (s_rtc_cb) {
+        s_rtc_cb(ctx->addr, &st, w.result);
+    }
+}
+
 static void model_cb(esp_ble_mesh_model_cb_event_t event,
                      esp_ble_mesh_model_cb_param_t *param)
 {
@@ -413,8 +645,14 @@ static void model_cb(esp_ble_mesh_model_cb_event_t event,
          * the latest here is what makes RSSI reportable at all -- nothing else
          * in the firmware ever sees an esp_ble_mesh_msg_ctx_t. */
         telemetry_note_rssi(ctx->recv_rssi);
+        neighbor_note(ctx->addr, esp_ble_mesh_get_primary_element_address(),
+                      ctx->recv_ttl, ctx->recv_rssi);
 
-        if (opcode == OP_ATTR_GET) {
+        if (opcode == OP_NEIGH_HELLO) {
+            /* Noted above; carrying nothing else is the whole point. */
+            ESP_LOGD(TAG, "hello from 0x%04x ttl %u rssi %d",
+                     ctx->addr, ctx->recv_ttl, ctx->recv_rssi);
+        } else if (opcode == OP_ATTR_GET) {
             handle_get(ctx, msg, len);
         } else if (opcode == OP_ATTR_SET) {
             handle_set(ctx, msg, len);
@@ -424,6 +662,14 @@ static void model_cb(esp_ble_mesh_model_cb_event_t event,
             handle_telem_get(ctx, msg, len);
         } else if (opcode == OP_TELEM_STATUS) {
             handle_telem_status(ctx, msg, len);
+        } else if (opcode == OP_NEIGH_GET) {
+            handle_neigh_get(ctx, msg, len);
+        } else if (opcode == OP_NEIGH_STATUS) {
+            handle_neigh_status(ctx, msg, len);
+        } else if (opcode == OP_RTC_SET) {
+            handle_rtc_set(ctx, msg, len);
+        } else if (opcode == OP_RTC_STATUS) {
+            handle_rtc_status(ctx, msg, len);
         } else if (opcode == OP_ATTR_STATUS) {
             handle_status(ctx, msg, len);
         } else if (opcode == OP_ATTR_SET_STATUS) {
@@ -435,6 +681,15 @@ static void model_cb(esp_ble_mesh_model_cb_event_t event,
         }
         break;
     }
+    case ESP_BLE_MESH_CLIENT_MODEL_SEND_TIMEOUT_EVT:
+        /* Only NEIGH_GET reports its timeout: a gateway sweep waits for each
+         * node in turn and should move on as soon as the stack gives up. */
+        if (param->client_send_timeout.opcode == OP_NEIGH_GET && s_neigh_cb) {
+            s_neigh_cb(param->client_send_timeout.ctx->addr, NULL, 0);
+        } else if (param->client_send_timeout.opcode == OP_RTC_SET && s_rtc_cb) {
+            s_rtc_cb(param->client_send_timeout.ctx->addr, NULL, RTC_RESULT_FAILED);
+        }
+        break;
     case ESP_BLE_MESH_MODEL_SEND_COMP_EVT:
         if (param->model_send_comp.err_code != ESP_OK) {
             ESP_LOGE(TAG, "send failed for opcode 0x%06x, err %d",
@@ -444,6 +699,49 @@ static void model_cb(esp_ble_mesh_model_cb_event_t event,
         break;
     default:
         break;
+    }
+}
+
+/* --- Neighbor HELLO ------------------------------------------------------- */
+
+/* TTL 0 to all-nodes: heard by every board in radio range and relayed by none.
+ * A node sends with its server model, the only one the gateway bound an app key
+ * to; a gateway keeps its key in the provisioner list, which only the client
+ * send path can select. */
+static void hello_send(void)
+{
+    bool                  gateway = (device_mode_get() == DEVICE_MODE_GATEWAY);
+    esp_ble_mesh_model_t *model   = gateway ? MODEL_CLIENT : MODEL_SERVER;
+
+    if (model->element == NULL || model->keys[0] == ESP_BLE_MESH_KEY_UNUSED) {
+        return;     /* not provisioned / configured yet -- the normal early state */
+    }
+
+    uint8_t                body = MESH_NEIGH_VER;
+    esp_ble_mesh_msg_ctx_t ctx = {
+        .net_idx  = ESP_BLE_MESH_NET_PRIMARY,
+        .app_idx  = model->keys[0],
+        .addr     = ESP_BLE_MESH_ADDR_ALL_NODES,
+        .send_ttl = 0,
+        .send_rel = false,
+    };
+
+    esp_err_t err = gateway
+        ? esp_ble_mesh_client_model_send_msg(model, &ctx, OP_NEIGH_HELLO, sizeof(body),
+                                             &body, 0, false, ROLE_PROVISIONER)
+        : esp_ble_mesh_server_model_send_msg(model, &ctx, OP_NEIGH_HELLO, sizeof(body),
+                                             &body);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "hello failed: %d", err);
+    }
+}
+
+static void hello_task(void *arg)
+{
+    for (;;) {
+        uint32_t ms = HELLO_MIN_MS + (esp_random() % (HELLO_MAX_MS - HELLO_MIN_MS + 1));
+        vTaskDelay(pdMS_TO_TICKS(ms));
+        hello_send();
     }
 }
 
@@ -460,6 +758,12 @@ esp_err_t mesh_attr_model_init(void)
     if (xTaskCreate(reply_task, "attr_reply", REPLY_TASK_STK, NULL,
                     REPLY_TASK_PRI, NULL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create reply task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskCreate(hello_task, "neigh_hello", HELLO_TASK_STK, NULL,
+                    HELLO_TASK_PRI, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create hello task");
         return ESP_ERR_NO_MEM;
     }
 
@@ -647,4 +951,31 @@ esp_err_t mesh_telem_get(uint16_t dst)
 
     ESP_LOGI(TAG, "requesting telemetry from 0x%04x", dst);
     return client_send(dst, OP_TELEM_GET, &body, sizeof(body), true);
+}
+
+esp_err_t mesh_neigh_get(uint16_t dst)
+{
+    if (!ESP_BLE_MESH_ADDR_IS_UNICAST(dst)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t body = MESH_NEIGH_VER;
+
+    ESP_LOGI(TAG, "requesting neighbors from 0x%04x", dst);
+    return client_send(dst, OP_NEIGH_GET, &body, sizeof(body), true);
+}
+
+esp_err_t mesh_rtc_send(uint16_t dst, const rtc_req_t *req)
+{
+    mesh_rtc_cmd_t cmd = {
+        .ver      = MESH_RTC_VER,
+        .op       = (uint8_t)req->op,
+        .mode     = (uint8_t)req->mode,
+        .absolute = req->absolute,
+        .a        = req->a,
+        .b        = req->b,
+    };
+
+    ESP_LOGI(TAG, "rtc op %u to 0x%04x", cmd.op, dst);
+    return client_send(dst, OP_RTC_SET, (uint8_t *)&cmd, sizeof(cmd), true);
 }

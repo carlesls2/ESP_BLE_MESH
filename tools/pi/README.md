@@ -1,15 +1,16 @@
 # Raspberry Pi ↔ ESP32 mesh-node link
 
 Connects a Raspberry Pi to the ESP32 gateway and gives it the full host command
-set (`MODE`, `ID`, `ASK`, `TELEM`, `NODES`, `SEND`, `HELP`) over **USB**,
-**UART**, or **SPI**.
+set (`MODE`, `ID`, `ASK`, `TELEM`, `NODES`, `NEIGHBORS`, `SEND`, `HELP`) over
+**USB**, **UART**, or **SPI**.
 
-Two programs:
+Three programs:
 
 | | |
 |---|---|
 | `meshctl.py` | the link itself — one-shot commands, an interactive REPL, and a `MeshLink` class other scripts import |
 | `mesh_survey.py` | asks every node in the mesh how it is doing, as a table, JSON, or CSV |
+| `mesh_neighbors.py` | asks every node which boards it hears directly, and prints the links with RSSI |
 
 ## Quick start
 
@@ -185,6 +186,14 @@ python3 mesh_survey.py --watch 10           # re-poll every 10 s
 python3 mesh_survey.py --csv log.csv        # append timestamped rows
 python3 mesh_survey.py --addr 0xC005        # one node
 python3 mesh_survey.py --no-gateway         # remote nodes only
+
+# neighbors (radio topology)
+python3 meshctl.py NEIGHBORS                # the attached board's own table
+python3 meshctl.py NEIGHBORS 0x0005         # ask one node, via the gateway
+python3 meshctl.py NEIGHBORS ALL            # ask every provisioned node
+python3 meshctl.py --json NEIGHBORS ALL
+python3 mesh_neighbors.py                   # links + RSSI matrix
+python3 mesh_neighbors.py --watch 30
 ```
 
 `--usb PORT` / `--uart PORT` / `--spi BUS.CS` override the defaults. Exit code
@@ -201,6 +210,8 @@ with MeshLink(usb=True) as m:
         print(hex(node["addr"]), node["uuid"])
     found, missing = m.telem_sweep([5, 8])       # how are they doing
     names = m.ask_sweep([5, 8], attrs=("NAME",))
+    tables, silent = m.neighbors_all()           # who hears whom
+    mine = m.neighbors()                         # the gateway's own table
 ```
 
 ## Protocol
@@ -216,12 +227,21 @@ ASK SET <addr> <attr> <value>    write an attribute on a remote node (gateway)
 SEND <addr|ALL> <text>           send text to remote nodes (gateway)
 TELEM <addr|ALL>                 live vitals, packed (gateway)
 NODES                            list nodes this gateway has provisioned
+NEIGHBORS                        nodes this board hears directly (RSSI, age)
+NEIGHBORS <addr|ALL>             a remote node's neighbors, or every node's (gateway)
+RTC [addr|ALL]                   clock, wake cause and duty cycle
+TIME SET [addr|ALL] <epoch|ISO>  set the clock (UTC)
+TIME SYNC <addr|ALL>             push this board's clock to nodes (gateway)
+SLEEP [addr] <LIGHT|DEEP> <s>    sleep for s seconds (not on a gateway)
+SLEEP [addr] <mode> UNTIL <time> sleep until a UTC time (epoch/ISO/HH:MM)
+DUTY [addr] <mode> <on_s> <off_s> [ALIGN]   repeat awake/asleep
+DUTY [addr|ALL] OFF              stop the duty cycle
 HELP [command]                   show the menu
 ```
 
 Errors start with `ERR `. Unsolicited lines arrive at any time once the device
 is a gateway (or receives a SEND): `JOINED`, `READY`, `MSG`, `ATTR`, `ATTRSET`,
-`TEXT`, `TELEM`.
+`TEXT`, `TELEM`, `NEIGH`, `NEIGHBORS`, `RTC`.
 
 ### SPI framing
 
@@ -264,6 +284,169 @@ Both fetch node state; they differ in how much air time they cost.
   subset, or the stored identity fields.
 - `TELEM` returns one packed 21-byte struct with every vital. Two segments
   instead of thirteen. Use it for the routine "how is everyone doing" sweep.
+
+## Neighbors
+
+Every board (firmware 0.6.0+) keeps a table of the boards it hears
+**directly**: one radio hop, not relayed. The Pi can read the table of any
+provisioned node through the gateway.
+
+```
+> NEIGHBORS ALL
+NEIGHBORS ALL started
+NEIGH 0x0005 0x0001 rssi=-40 avg=-42 age=3 n=57
+NEIGH 0x0005 0x0006 rssi=-70 avg=-71 age=8 n=12
+NEIGHBORS 0x0005 count=2
+NEIGHBORS 0x0006 count=0
+NEIGHBORS 0x0007 noreply
+NEIGHBORS ALL done asked=3 replied=2
+```
+
+`NEIGH <reporter> <peer> …` means *reporter hears peer*:
+
+| Field | Meaning |
+|---|---|
+| `rssi` | RSSI of the last packet, in dBm |
+| `avg` | running average of the RSSI (1/8 weight per packet) |
+| `age` | seconds since the peer was last heard |
+| `n` | packets counted |
+
+Entries are sorted strongest `avg` first. A local `NEIGHBORS` uses the same
+format, with the board's own address as the reporter.
+
+**How boards find each other.** Every provisioned board sends a one-byte
+`HELLO` to all nodes every 8–12 s, with **TTL 0**. A TTL-0 packet is never
+relayed, so only boards in radio range hear it.
+
+- Allow about 15 s after boot for the tables to fill.
+- A board that goes quiet drops out after 60 s.
+- Other traffic also counts, but only when it arrives with the TTL it was
+  sent with (7). A relayed packet's RSSI belongs to the relay, not the source,
+  so relayed packets are ignored.
+
+The existing OnOff broadcasts can't do this job. A node's OnOff models have no
+app key bound, so those packets never reach application code on other nodes.
+
+**`ALL` is a sweep, not a broadcast.** Group-addressed replies are dropped by
+the client model (see **Broadcast replies are not delivered** below). So the
+gateway asks each provisioned node in turn:
+
+- It waits for each answer, or for the stack's ~4 s timeout, before asking the
+  next node.
+- It reports `noreply` for silent nodes.
+- It ends with the `done` line.
+
+Budget about 6 s per silent node. `meshctl.py` sizes its wait from `NODES`.
+
+**Relay is on** from 0.6.0, so a node out of the gateway's range is reached
+through whichever board sits between them. `mesh_neighbors.py` shows which
+boards those are.
+
+`mesh_neighbors.py` combines the gateway's own table with the sweep:
+
+```
+links (average RSSI in dBm, as heard at each end)
+  0x0001 (gw)        <->  0x0005 bench-node  -43  -42
+  0x0005 bench-node  <->  0x0006             -71  deaf  one-way
+```
+
+The two numbers are what each end hears. Other values in those columns:
+
+- **`deaf`**: that end answered but does not list the other board. The link
+  only works one way.
+- **`?`**: that end was not heard from.
+
+## Clock, sleep and wake-up
+
+Every board (firmware 0.6.0+) keeps a UTC clock and can sleep on command or on
+a schedule. The code is in `lib/rtc`, in two layers:
+
+- **`rtc_dev`** is the low-level device: one interface with two backends.
+  - `INTERNAL` is the ESP32's own RTC. It keeps counting through deep sleep
+    but loses the date at power-off. It runs off a ~5 %-accurate RC
+    oscillator.
+  - `DS3231` is an I2C chip with a backup battery, accurate to ±2 ppm. Its
+    alarm pin wakes the ESP32.
+- **`rtc_mgr`** is the middleware. It handles time, sleeping for a duration or
+  until a time, duty cycles, and the wake cause. Firmware code calls it
+  directly; the commands below reach it from the host or over the mesh.
+
+Every answer uses one line shape, whether local or remote:
+
+```
+RTC 0x0005 OK time=2026-09-30T12:00:00Z valid=1 backend=INTERNAL wake=TIMER duty=light/5/8
+```
+
+| Field | Meaning |
+|---|---|
+| Result (after the address) | `OK`, `BAD_ARG`, `REFUSED` or `FAILED` |
+| `valid` | `0` until the clock has been set |
+| `wake` | why the board last woke: `RESET` (power-on or reboot), `TIMER`, or `ALARM` (DS3231) |
+| `duty` | `off`, or `mode/awake/asleep`, with `/align` added when aligned |
+
+```sh
+python3 meshctl.py --uart TIME SET $(date -u +%s)   # set the gateway from the Pi
+python3 meshctl.py --uart TIME SYNC ALL             # ...and push it to every node
+python3 meshctl.py --uart RTC 0x0005               # one node's clock and schedule
+python3 meshctl.py --uart SLEEP 0x0005 DEEP 600    # deep sleep 10 min
+python3 meshctl.py --uart SLEEP 0x0005 LIGHT UNTIL 06:00
+python3 meshctl.py --uart DUTY 0x0005 DEEP 30 570 ALIGN   # awake 30 s every 10 min
+python3 meshctl.py --uart DUTY 0x0005 OFF
+python3 meshctl.py --uart --json RTC 0x0005
+```
+
+A remote address must be written as `0x....` or `ALL`. A bare number after
+`TIME SET` is an epoch, not an address.
+
+**The two sleep modes:**
+
+| | light | deep |
+|---|---|---|
+| Current | ~0.8 mA | ~10 µA |
+| RAM | kept; resumes where it stopped | lost; the chip reboots |
+| Back on the mesh after wake | at once | a few seconds (rejoins from NVS) |
+
+In both modes the radio is off, so a sleeping board cannot relay, answer, or
+send HELLOs. It drops out of neighbor tables after 60 s. Plan relay paths
+around boards that duty-cycle.
+
+**The gateway never sleeps.** `SLEEP` and `DUTY` are refused on a gateway,
+because it is the host's only way into the mesh. Also, a gateway booted from
+NVS cannot send until its role is toggled; see **Known behaviours**.
+
+**Sleep starts 1 s after the command,** so the reply (and, over the mesh, the
+`RTC … OK` answer) gets out first.
+
+**Duty cycles:**
+
+- The schedule is saved in NVS, so a deep-sleeping node picks it up again on
+  every wake.
+- The awake window must be at least 5 s, and a single sleep at most 7 days.
+- `ALIGN` wakes on wall-clock multiples of awake + asleep. Every aligned node
+  with the same schedule then wakes together, which is when to send it
+  commands.
+- A node only hears commands, `DUTY OFF` included, while it is awake. From
+  the Pi, retry until one lands in the awake window.
+
+**Accuracy.** On the internal RC oscillator, a 20 s light or deep sleep
+measured within 1 s of the Pi's clock. Over hours, expect the ~5 % RC error,
+so for long schedules either `TIME SYNC` now and then, or fit a DS3231:
+
+```ini
+; platformio.ini -- then rebuild. If no chip answers, the firmware logs a
+; warning and falls back to the internal RTC.
+    -DRTC_DS3231_SDA=21
+    -DRTC_DS3231_SCL=22
+    -DRTC_ALARM_GPIO=33   ; DS3231 INT/SQW; must be an RTC GPIO
+```
+
+With a DS3231 fitted:
+
+- It is the master clock: it sets the system clock at boot and is written on
+  every `TIME SET`.
+- Its alarm wakes the board, with the sleep timer as a backstop.
+- `valid=0` there means its oscillator stopped (for example, a flat backup
+  battery) and the clock needs setting again.
 
 ## Checking the gateway
 

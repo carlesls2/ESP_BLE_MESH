@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -41,6 +42,7 @@
 #include "device_mode.h"
 #include "cmd_proto.h"
 #include "mesh_attr_model.h"
+#include "neighbor.h"
 #include "spi_cmd.h"
 #include "telemetry.h"
 #include "uart_cmd.h"
@@ -75,7 +77,10 @@ static struct esp_ble_mesh_key {
 } prov_key;
 
 static esp_ble_mesh_cfg_srv_t config_server = {
-    .relay = ESP_BLE_MESH_RELAY_DISABLED,
+    /* Relay on, so a node out of the gateway's range is still reachable through
+     * whichever board sits between them. The neighbor table tells relayed
+     * packets from direct ones by TTL (see lib/neighbor). */
+    .relay = ESP_BLE_MESH_RELAY_ENABLED,
     .beacon = ESP_BLE_MESH_BEACON_ENABLED,
 #if defined(CONFIG_BLE_MESH_FRIEND)
     .friend_state = ESP_BLE_MESH_FRIEND_ENABLED,
@@ -699,13 +704,178 @@ static esp_err_t gateway_list_nodes(cmd_proto_reply_fn emit)
     return ESP_OK;
 }
 
-/* Bundled so the five pointers cannot be transposed at the call site. */
+/* --- Neighbors ------------------------------------------------------------
+ *
+ * Every table, local or remote, is rendered in the same shape so the host
+ * needs one parser:
+ *
+ *     NEIGH <reporter> <peer> rssi=<last> avg=<avg> age=<s> n=<count>
+ *     NEIGHBORS <reporter> count=<n>          terminator
+ *     NEIGHBORS <reporter> noreply            remote node did not answer
+ *
+ * Each line stays inside the SPI transport's 63-character frame. */
+
+/* One NEIGHBORS ALL sweep at a time; the node being asked and whether it has
+ * answered are shared between the sweep task and the mesh callback. */
+static SemaphoreHandle_t s_sweep_done = NULL;
+static volatile bool     s_sweep_running = false;
+static volatile uint16_t s_sweep_target = 0x0000;
+static volatile bool     s_sweep_replied = false;
+
+static void neigh_format(char *line, size_t size, uint16_t reporter,
+                         const mesh_neigh_wire_t *e)
+{
+    snprintf(line, size, "NEIGH 0x%04x 0x%04x rssi=%d avg=%d age=%u n=%u",
+             reporter, e->addr, (int)e->rssi_last, (int)e->rssi_avg,
+             (unsigned)e->age_s, (unsigned)e->heard);
+}
+
+/* A remote node's table (or its silence) arrived. */
+static void attr_neigh_to_host(uint16_t src_addr, const mesh_neigh_wire_t *entries,
+                               size_t count)
+{
+    if (entries == NULL) {
+        gateway_bridge_emitf("NEIGHBORS 0x%04x noreply", src_addr);
+    } else {
+        char line[64];
+        for (size_t i = 0; i < count; i++) {
+            neigh_format(line, sizeof(line), src_addr, &entries[i]);
+            gateway_bridge_emitf("%s", line);
+        }
+        gateway_bridge_emitf("NEIGHBORS 0x%04x count=%u", src_addr, (unsigned)count);
+    }
+
+    if (s_sweep_running && src_addr == s_sweep_target) {
+        s_sweep_replied = (entries != NULL);
+        xSemaphoreGive(s_sweep_done);
+    }
+}
+
+/* NEIGHBORS: this board's own table, to whoever asked. */
+static esp_err_t neigh_local(cmd_proto_reply_fn emit)
+{
+    neighbor_entry_t entries[NEIGH_MAX];
+    size_t           n = neighbor_snapshot(entries, NEIGH_MAX);
+    uint16_t         self = esp_ble_mesh_get_primary_element_address();
+    char             line[64];
+
+    for (size_t i = 0; i < n; i++) {
+        mesh_neigh_wire_t w = {
+            .addr      = entries[i].addr,
+            .rssi_last = entries[i].rssi_last,
+            .rssi_avg  = entries[i].rssi_avg,
+            .age_s     = entries[i].age_s,
+            .heard     = entries[i].heard,
+        };
+        neigh_format(line, sizeof(line), self, &w);
+        emit(line);
+    }
+    snprintf(line, sizeof(line), "NEIGHBORS 0x%04x count=%u", self, (unsigned)n);
+    emit(line);
+    return ESP_OK;
+}
+
+/* Asks each provisioned node in turn and waits for its answer (or the client
+ * model's ~4 s timeout) before moving on. Sequential on purpose: group replies
+ * are dropped by the client model, and firing every request at once would have
+ * all the nodes answering together. */
+#define NEIGH_SWEEP_WAIT_MS 6000
+
+static void neigh_sweep_task(void *arg)
+{
+    uint16_t addrs[CONFIG_BLE_MESH_MAX_PROV_NODES];
+    unsigned asked = 0;
+    unsigned replied = 0;
+
+    /* Copy the addresses first: provisioning may change the table mid-sweep. */
+    size_t n = 0;
+    const esp_ble_mesh_node_t **table = esp_ble_mesh_provisioner_get_node_table_entry();
+    for (int i = 0; table != NULL && i < CONFIG_BLE_MESH_MAX_PROV_NODES; i++) {
+        if (table[i] != NULL && table[i]->unicast_addr != PROV_OWN_ADDR) {
+            addrs[n++] = table[i]->unicast_addr;
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        if (device_mode_get() != DEVICE_MODE_GATEWAY) {
+            break;
+        }
+        s_sweep_target = addrs[i];
+        s_sweep_replied = false;
+        xSemaphoreTake(s_sweep_done, 0);    /* drop a stale give */
+        asked++;
+
+        if (mesh_neigh_get(addrs[i]) != ESP_OK) {
+            gateway_bridge_emitf("NEIGHBORS 0x%04x noreply", addrs[i]);
+            continue;
+        }
+        if (xSemaphoreTake(s_sweep_done, pdMS_TO_TICKS(NEIGH_SWEEP_WAIT_MS)) != pdTRUE) {
+            gateway_bridge_emitf("NEIGHBORS 0x%04x noreply", addrs[i]);
+        } else if (s_sweep_replied) {
+            replied++;
+        }
+    }
+
+    gateway_bridge_emitf("NEIGHBORS ALL done asked=%u replied=%u", asked, replied);
+    s_sweep_target = 0x0000;
+    s_sweep_running = false;
+    vTaskDelete(NULL);
+}
+
+/* NEIGHBORS <addr|ALL>, gateway only. ESP_ERR_INVALID_ARG for our own address
+ * tells the command layer to answer locally instead. */
+static esp_err_t neigh_query(uint16_t dst)
+{
+    if (device_mode_get() != DEVICE_MODE_GATEWAY) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (dst == esp_ble_mesh_get_primary_element_address()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (dst != 0xFFFF) {
+        return mesh_neigh_get(dst);
+    }
+
+    if (s_sweep_running) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    if (s_sweep_done == NULL) {
+        s_sweep_done = xSemaphoreCreateBinary();
+        if (s_sweep_done == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_sweep_running = true;
+    if (xTaskCreate(neigh_sweep_task, "neigh_sweep", 3072, NULL, 5, NULL) != pdPASS) {
+        s_sweep_running = false;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/* A node answered an RTC / TIME / SLEEP / DUTY request, or went silent. Same
+ * line shape as the local RTC? reply, so the host has one parser. */
+static void attr_rtc_to_host(uint16_t src_addr, const rtc_status_t *st, uint8_t result)
+{
+    if (st == NULL) {
+        gateway_bridge_emitf("RTC 0x%04x noreply", src_addr);
+        return;
+    }
+    char status[112];
+    rtc_mgr_format_status(st, status, sizeof(status));
+    gateway_bridge_emitf("RTC 0x%04x %s %s", src_addr, rtc_mgr_result_name(result), status);
+}
+
+/* Bundled so the pointers cannot be transposed at the call site. */
 static const cmd_mesh_ops_t s_mesh_ops = {
-    .get   = mesh_attr_get,
-    .set   = mesh_attr_set,
-    .send  = mesh_attr_send_text,
-    .telem = mesh_telem_get,
-    .nodes = gateway_list_nodes,
+    .get         = mesh_attr_get,
+    .set         = mesh_attr_set,
+    .send        = mesh_attr_send_text,
+    .telem       = mesh_telem_get,
+    .nodes       = gateway_list_nodes,
+    .neigh_local = neigh_local,
+    .neigh_query = neigh_query,
+    .rtc         = mesh_rtc_send,
 };
 
 /* Fills in the boilerplate for a Config Client request aimed at `unicast`.
@@ -845,7 +1015,9 @@ static esp_err_t ble_mesh_init(void)
         return err;
     }
     mesh_attr_model_register_cbs(attr_status_to_host, attr_set_status_to_host,
-                                 attr_text_to_host, attr_telem_to_host);
+                                 attr_text_to_host, attr_telem_to_host,
+                                 attr_neigh_to_host);
+    mesh_attr_model_register_rtc_cb(attr_rtc_to_host);
     /* Lets the ASK, SEND, TELEM and NODES verbs on the host channel reach the
      * mesh without lib/cmd having to depend on lib/BLE. */
     cmd_proto_register_mesh(&s_mesh_ops);
@@ -918,6 +1090,9 @@ static void broadcast_group_cb(void *arg)
 static esp_err_t ble_mesh_apply_mode(device_mode_t mode)
 {
     esp_err_t err;
+
+    /* A role switch changes networks; last network's neighbors mean nothing. */
+    neighbor_clear();
 
     if (mode == DEVICE_MODE_GATEWAY) {
         /* The stack allows one role at a time and stores it in NVS: with node

@@ -8,6 +8,7 @@
 #include "blue_led.h"
 #include "dev_identity.h"
 #include "device_mode.h"
+#include "rtc_mgr.h"
 #include "spi_cmd.h"
 #include "telemetry.h"
 #include "uart_cmd.h"
@@ -30,6 +31,13 @@ void app_main()
 	ESP_ERROR_CHECK(err);
 
 	ESP_ERROR_CHECK(device_mode_init());
+
+	/* After NVS (stored duty cycle) and the mode (a gateway never sleeps);
+	 * before anything that reads the clock. A stored duty cycle resumes here,
+	 * which is how a deep-sleeping node carries on after every wake. */
+	if (rtc_mgr_init() != ESP_OK) {
+		ESP_LOGE(TAG, "RTC / sleep manager unavailable");
+	}
 
 	/* Telemetry first: it registers the providers behind the dynamic attribute
 	 * rows, so dev_identity_init() can print them in its boot summary. */

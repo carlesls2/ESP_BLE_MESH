@@ -13,6 +13,14 @@
  *       SEND <addr|ALL> <text>
  *       TELEM <addr|ALL>    live vitals, packed (see mesh_attr_model.h)
  *       NODES               who this gateway has provisioned
+ *       NEIGHBORS [addr|ALL] nodes heard directly over the radio
+ *       RTC [addr|ALL]      clock, wake cause and duty cycle
+ *       TIME SET [addr|ALL] <epoch|ISO|HH:MM> / TIME SYNC <addr|ALL>
+ *       SLEEP [addr|ALL] <LIGHT|DEEP> <seconds | UNTIL time>
+ *       DUTY [addr|ALL] <LIGHT|DEEP> <awake_s> <sleep_s> [ALIGN] / DUTY [addr|ALL] OFF
+ *
+ *   A remote address must be written 0x.... or ALL, so it cannot be mistaken
+ *   for an epoch.
  *       HELP [command]      ("--help" and "<command> --help" work too)
  *
  *   Binary, 2 bytes, for a host driving SPI:
@@ -34,6 +42,7 @@
 #include "esp_err.h"
 
 #include "dev_attr.h"
+#include "rtc_mgr.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,15 +94,29 @@ typedef esp_err_t (*cmd_mesh_telem_fn)(uint16_t dst);
  * issuing transport's reply hook, and may be called any number of times. */
 typedef esp_err_t (*cmd_mesh_nodes_fn)(cmd_proto_reply_fn emit);
 
-/* Grouped into a struct rather than passed positionally: five bare function
- * pointers at one call site is a swap waiting to happen, and the compiler
- * cannot catch it when several share a signature. */
+/* NEIGHBORS with no address lists this board's own table synchronously through
+ * `emit`, in either role. With a unicast address the gateway asks that node and
+ * the answer arrives on the bridge; with 0xFFFF (ALL) the gateway asks every
+ * node it provisioned, one after another. */
+typedef esp_err_t (*cmd_mesh_neigh_local_fn)(cmd_proto_reply_fn emit);
+typedef esp_err_t (*cmd_mesh_neigh_query_fn)(uint16_t dst);
+
+/* RTC / TIME / SLEEP / DUTY aimed at a remote node (or 0xFFFF for all): the
+ * request travels as-is and the node runs it through rtc_mgr_apply(). */
+typedef esp_err_t (*cmd_mesh_rtc_fn)(uint16_t dst, const rtc_req_t *req);
+
+/* Grouped into a struct rather than passed positionally: a row of bare
+ * function pointers at one call site is a swap waiting to happen, and the
+ * compiler cannot catch it when several share a signature. */
 typedef struct {
-    cmd_mesh_get_fn   get;
-    cmd_mesh_set_fn   set;
-    cmd_mesh_send_fn  send;
-    cmd_mesh_telem_fn telem;
-    cmd_mesh_nodes_fn nodes;
+    cmd_mesh_get_fn         get;
+    cmd_mesh_set_fn         set;
+    cmd_mesh_send_fn        send;
+    cmd_mesh_telem_fn       telem;
+    cmd_mesh_nodes_fn       nodes;
+    cmd_mesh_neigh_local_fn neigh_local;
+    cmd_mesh_neigh_query_fn neigh_query;
+    cmd_mesh_rtc_fn         rtc;
 } cmd_mesh_ops_t;
 
 /* `ops` is stored by pointer and must outlive registration -- pass a static. */
