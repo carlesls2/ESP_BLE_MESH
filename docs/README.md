@@ -19,8 +19,8 @@ rather than repeat it.
 | Link | ESP32 end | Host end | Host device | Host software |
 |------|-----------|----------|-------------|---------------|
 | USB  | UART0 through the on-board CP2102 bridge. It shares the line with the ESP-IDF log. `lib/cmd/uart_cmd.c` | USB cable to the PC or the Pi | `COM3`, `COM4`, … on Windows; `/dev/ttyUSB0` on the Pi | PlatformIO (flash, monitor), `meshctl.py` |
-| UART | UART2: TX GPIO17, RX GPIO16. `lib/cmd/uart2_cmd.c` | Pi header pins 8 (TXD) and 10 (RXD) | `/dev/ttyAMA0` | `meshctl.py`, `mesh_survey.py`, through pyserial |
-| SPI  | SPI3 (VSPI) slave: MOSI 23, MISO 19, SCLK 18, CS 5. `lib/cmd/spi_cmd.c` | Pi SPI0 master on CE0 | `/dev/spidev0.0` | `meshctl.py`, `mesh_survey.py`, through spidev |
+| UART | UART2: TX GPIO17, RX GPIO16. `lib/cmd/uart2_cmd.c` | Pi header pins 8 (TXD) and 10 (RXD) | `/dev/ttyAMA0` | `meshctl.py`, `mesh_survey.py`, `mesh_neighbors.py`, through pyserial |
+| SPI  | SPI3 (VSPI) slave: MOSI 23, MISO 19, SCLK 18, CS 5. `lib/cmd/spi_cmd.c` | Pi SPI0 master on CE0 | `/dev/spidev0.0` | `meshctl.py`, `mesh_survey.py`, `mesh_neighbors.py`, through spidev |
 
 All three links feed one parser, `lib/cmd/cmd_proto.c`, so they all take the
 same commands. The reply to a command goes back on the link the command came in

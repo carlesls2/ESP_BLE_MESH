@@ -141,19 +141,20 @@ sudo usermod -aG dialout,spi "$USER"
 
 ## 5. Install the tools
 
-`meshctl.py` and `mesh_survey.py` are plain Python 3 scripts that need nothing
-beyond step 3. Keep them in the same folder, because `mesh_survey.py` imports
-`meshctl.py` from its own directory.
+`meshctl.py`, `mesh_survey.py` and `mesh_neighbors.py` are plain Python 3
+scripts that need nothing beyond step 3. Keep them in the same folder, because
+`mesh_survey.py` and `mesh_neighbors.py` import `meshctl.py` from their own
+directory.
 
 Copy them from the repository on the PC. Windows 10 includes the OpenSSH
 client, so this works from PowerShell:
 
 ```powershell
 ssh <user>@rpi.local "mkdir -p ~/mesh"
-scp tools/pi/meshctl.py tools/pi/mesh_survey.py tools/pi/README.md <user>@rpi.local:~/mesh/
+scp tools/pi/meshctl.py tools/pi/mesh_survey.py tools/pi/mesh_neighbors.py tools/pi/README.md <user>@rpi.local:~/mesh/
 ```
 
-Run the `scp` again whenever either script changes; there is no other install
+Run the `scp` again whenever a script changes; there is no other install
 step. You can also clone the repository on the Pi and run the scripts from
 `tools/pi/` where they are.
 
