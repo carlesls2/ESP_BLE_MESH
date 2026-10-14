@@ -1,0 +1,2 @@
+# These files run on the Pi; CRLF from a Windows checkout would break them.
+* text eol=lf

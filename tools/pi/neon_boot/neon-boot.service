@@ -1,0 +1,12 @@
+[Unit]
+Description=Log this boot to Neon Postgres
+
+[Service]
+# exec, not oneshot: a oneshot still retrying would hold up default.target,
+# and with it any login, until the network comes back.
+Type=exec
+ExecStart=%h/neon-boot/.venv/bin/python %h/neon-boot/neon_boot.py
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
